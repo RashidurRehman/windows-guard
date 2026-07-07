@@ -149,11 +149,13 @@ fn run_powershell(script: &str) -> Result<(), String> {
     if out.status.success() {
         Ok(())
     } else {
-        match out.status.code() {
-            Some(1223) => Err("Admin approval was cancelled.".into()),
-            Some(c) => Err(format!("Failed (exit {c}).")),
-            None => Err("Failed.".into()),
-        }
+        // A declined/dismissed UAC prompt has been observed to surface as
+        // different exit codes depending on Windows version (the documented
+        // ERROR_CANCELLED 1223, but also a generic E_FAIL-shaped -2147467259
+        // from the underlying .NET exception) — since our script's only path
+        // to a non-1223 failure IS an elevation that didn't happen, treat any
+        // failure here the same way rather than showing a cryptic exit code.
+        Err("Admin permission wasn't granted.".into())
     }
 }
 

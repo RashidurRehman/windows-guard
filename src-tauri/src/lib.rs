@@ -1012,6 +1012,20 @@ pub fn run() {
                 }
             }
 
+            // First run with elevated mode on (the default) but the logon task
+            // doesn't exist yet: register it now — this is the ONE UAC prompt
+            // the user ever sees. If they approve, hand off immediately so this
+            // unelevated instance never shows a window; if they decline, we
+            // just continue running unelevated rather than getting stuck (and
+            // don't retry until the next launch, so declining isn't naggy).
+            if config.elevated_mode && !privilege::is_elevated() && !elevate::task_installed() {
+                if let Ok(exe) = std::env::current_exe() {
+                    if elevate::install_task(&exe).is_ok() && elevate::run_task_now().is_ok() {
+                        std::process::exit(0);
+                    }
+                }
+            }
+
             // Rename migration: clean up any scheduled task from a prior
             // product name, and if elevated mode is on but the (new-name)
             // logon task doesn't exist yet, register it now. Both no-ops
