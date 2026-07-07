@@ -224,6 +224,21 @@
             <section class="panel">
               <div class="panel-head"><h2>General</h2></div>
               <div class="settings">
+                <div class="update-card" id="update-card">
+                  <div class="update-row">
+                    <div>
+                      <div class="update-title" id="update-title">Checking for updates…</div>
+                      <div class="update-sub" id="update-sub">Windows Guard <span id="app-version">—</span></div>
+                    </div>
+                    <div class="row-inline">
+                      <button id="check-update-btn" type="button" class="btn ghost small">Check now</button>
+                      <button id="restart-update-btn" type="button" class="btn primary small hidden">Restart to update</button>
+                    </div>
+                  </div>
+                  <div class="update-progress hidden" id="update-progress-wrap">
+                    <div class="update-progress-bar" id="update-progress-bar"></div>
+                  </div>
+                </div>
                 <div class="setting">
                   <div class="setting-text">
                     <div class="s-title">Start on Windows login</div>

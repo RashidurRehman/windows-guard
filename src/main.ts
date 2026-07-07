@@ -1,5 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getVersion } from "@tauri-apps/api/app";
+import { check, type Update } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 
 // ---- Types mirroring the Rust payloads ----
 type Method = "inject" | "electron-patch" | "hide-during-capture";
@@ -499,6 +502,92 @@ function renderLog(entriesNewestFirst: LogEntry[]) {
   }
   for (const e of entriesNewestFirst) addLogRow(e, false);
   log.scrollTop = 0;
+}
+
+// ---- Auto-update ----
+let pendingUpdate: Update | null = null;
+const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
+
+async function initUpdater() {
+  try {
+    $("#app-version").textContent = `v${await getVersion()}`;
+  } catch (e) {
+    console.error(e);
+  }
+  checkForUpdates(false);
+  setInterval(() => checkForUpdates(false), UPDATE_CHECK_INTERVAL_MS);
+}
+
+async function checkForUpdates(manual: boolean) {
+  const title = $("#update-title");
+  const btn = $("#check-update-btn") as HTMLButtonElement;
+  if (manual) {
+    title.textContent = "Checking for updates…";
+    btn.disabled = true;
+  }
+  try {
+    const update = await check();
+    if (update) {
+      pendingUpdate = update;
+      title.textContent = `Update available: v${update.version}`;
+      await downloadUpdateInBackground(update);
+    } else if (manual || !pendingUpdate) {
+      title.textContent = "Up to date";
+    }
+  } catch (e) {
+    if (manual) title.textContent = "Couldn't check for updates";
+    console.error(e);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function downloadUpdateInBackground(update: Update) {
+  const title = $("#update-title");
+  const wrap = $("#update-progress-wrap");
+  const bar = $("#update-progress-bar") as HTMLElement;
+  wrap.classList.remove("hidden");
+  bar.style.width = "0%";
+  let total = 0;
+  let downloaded = 0;
+
+  try {
+    await update.download((event) => {
+      if (event.event === "Started") {
+        total = event.data.contentLength ?? 0;
+      } else if (event.event === "Progress") {
+        downloaded += event.data.chunkLength;
+        const pct = total ? Math.min(100, Math.round((downloaded / total) * 100)) : 0;
+        bar.style.width = `${pct}%`;
+        title.textContent = `Downloading update v${update.version}… ${pct}%`;
+      } else if (event.event === "Finished") {
+        bar.style.width = "100%";
+      }
+    });
+    title.textContent = `Update v${update.version} ready`;
+    wrap.classList.add("hidden");
+    $("#restart-update-btn").classList.remove("hidden");
+    $("#check-update-btn").classList.add("hidden");
+  } catch (e) {
+    title.textContent = "Update download failed";
+    wrap.classList.add("hidden");
+    console.error(e);
+  }
+}
+
+async function onRestartToUpdate() {
+  if (!pendingUpdate) return;
+  const btn = $("#restart-update-btn") as HTMLButtonElement;
+  btn.disabled = true;
+  btn.textContent = "Installing…";
+  try {
+    await pendingUpdate.install();
+    await relaunch();
+  } catch (e) {
+    alert(`Update install failed: ${e}`);
+    btn.disabled = false;
+    btn.textContent = "Restart to update";
+  }
 }
 
 // ---- Tabs (thin icon sidebar) ----
@@ -1109,6 +1198,8 @@ function wireEvents() {
     });
   });
   $("#open-folder").addEventListener("click", () => invoke("open_config_folder"));
+  $("#check-update-btn").addEventListener("click", () => checkForUpdates(true));
+  $("#restart-update-btn").addEventListener("click", onRestartToUpdate);
   $("#clear-log").addEventListener("click", () => {
     $("#log").innerHTML = `<div class="log-empty">No activity yet.</div>`;
   });
@@ -1158,6 +1249,7 @@ async function boot() {
   });
   invoke<SyncStatus>("get_sync_status").then(renderSyncStatus);
   invoke<SyncEvent[]>("get_sync_events", { limit: 200 }).then(renderSyncEvents);
+  initUpdater();
 }
 
 window.addEventListener("DOMContentLoaded", boot);

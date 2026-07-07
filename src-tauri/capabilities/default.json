@@ -12,6 +12,8 @@
     "core:window:allow-set-focus",
     "core:window:allow-unminimize",
     "opener:default",
-    "autostart:default"
+    "autostart:default",
+    "updater:default",
+    "process:allow-restart"
   ]
 }
