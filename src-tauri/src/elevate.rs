@@ -95,8 +95,9 @@ pub fn restart_elevated(exe: &Path) -> Result<(), String> {
     if task_installed() && run_task_now().is_ok() {
         return Ok(());
     }
+    // No forced `--minimized` here either — see the note on `task_xml` for why.
     let script = format!(
-        "$ErrorActionPreference='Stop'; try {{ Start-Process -FilePath \"{}\" -ArgumentList '--minimized' -Verb RunAs; exit 0 }} catch {{ exit 1223 }}",
+        "$ErrorActionPreference='Stop'; try {{ Start-Process -FilePath \"{}\" -Verb RunAs; exit 0 }} catch {{ exit 1223 }}",
         exe.display()
     );
     run_powershell(&script)
@@ -166,6 +167,13 @@ fn current_user() -> String {
     }
 }
 
+/// No `--minimized` argument here deliberately: this same task also fires for
+/// the non-elevated->elevated hand-off on every manual launch (see `setup()`
+/// in lib.rs), not just the logon trigger. Hardcoding `--minimized` used to
+/// mean ANY manual launch got silently redirected through this task and came
+/// up hidden, regardless of the user's actual "start minimized" setting.
+/// Whether to hide now comes solely from the persisted `start_minimized`
+/// config, which both launch paths already read.
 fn task_xml(user: &str, exe: &Path) -> String {
     let u = xml_escape(user);
     let cmd = xml_escape(&exe.display().to_string());
@@ -186,7 +194,7 @@ fn task_xml(user: &str, exe: &Path) -> String {
     <Enabled>true</Enabled>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
   </Settings>
-  <Actions Context="Author"><Exec><Command>{cmd}</Command><Arguments>--minimized</Arguments></Exec></Actions>
+  <Actions Context="Author"><Exec><Command>{cmd}</Command></Exec></Actions>
 </Task>"#
     )
 }
