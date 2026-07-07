@@ -798,6 +798,57 @@ fn open_sync_log_folder(app: AppHandle) {
     let _ = app.opener().open_path(dir.to_string_lossy().to_string(), None::<String>);
 }
 
+#[derive(Serialize)]
+struct ScreenshotInfo {
+    filename: String,
+    taken_at_ms: u64,
+    data_uri: String,
+}
+
+/// The most recent cloned WebWorkTracker screenshots, newest first, as data
+/// URIs for a thumbnail grid. Only WebWorkTracker has actual recovered image
+/// data — every other tracker is detected via the RAM-spike heuristic only,
+/// so there's no captured image to show for those.
+#[tauri::command]
+fn list_webwork_screenshots(app: AppHandle, limit: Option<usize>) -> Vec<ScreenshotInfo> {
+    let dir = app.state::<AppState>().config_dir.join("webwork-clones");
+    let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+
+    let mut files: Vec<(std::path::PathBuf, std::time::SystemTime)> = entries
+        .flatten()
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("jpg"))
+        .filter_map(|e| e.metadata().ok().and_then(|m| m.modified().ok()).map(|t| (e.path(), t)))
+        .collect();
+    files.sort_by(|a, b| b.1.cmp(&a.1));
+    files.truncate(limit.unwrap_or(24));
+
+    files
+        .into_iter()
+        .filter_map(|(path, modified)| {
+            let bytes = std::fs::read(&path).ok()?;
+            let taken_at_ms = modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            Some(ScreenshotInfo {
+                filename: path.file_name()?.to_string_lossy().to_string(),
+                taken_at_ms,
+                data_uri: format!(
+                    "data:image/jpeg;base64,{}",
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes)
+                ),
+            })
+        })
+        .collect()
+}
+
+#[tauri::command]
+fn open_webwork_screenshots_folder(app: AppHandle) {
+    let dir = app.state::<AppState>().config_dir.join("webwork-clones");
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = app.opener().open_path(dir.to_string_lossy().to_string(), None::<String>);
+}
+
 #[tauri::command]
 fn open_config_folder(app: AppHandle) {
     let dir = app.state::<AppState>().config_dir.clone();
@@ -915,6 +966,8 @@ pub fn run() {
             get_sync_events,
             get_sync_day_index,
             get_sync_day_events,
+            list_webwork_screenshots,
+            open_webwork_screenshots_folder,
             wipe_sync_events,
             open_sync_log_folder,
             open_config_folder,

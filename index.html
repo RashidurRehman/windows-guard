@@ -177,9 +177,17 @@
           <section class="panel event-panel">
             <div class="panel-head">
               <h2>Screenshot events</h2>
-              <button id="sync-clear-events" class="btn ghost small">Clear</button>
+              <div class="head-actions">
+                <div class="mini-tabs" id="event-subtabs">
+                  <button type="button" class="mini-tab active" data-subtab="events">Events</button>
+                  <button type="button" class="mini-tab" data-subtab="screenshots">Screenshots</button>
+                </div>
+                <button id="open-screenshots-folder" class="btn ghost small" title="Open the folder with all cloned WebWorkTracker screenshots">Open folder</button>
+                <button id="sync-clear-events" class="btn ghost small">Clear</button>
+              </div>
             </div>
             <div id="sync-events" class="log"></div>
+            <div id="sync-screenshots" class="screenshot-grid hidden"></div>
           </section>
         </section>
 

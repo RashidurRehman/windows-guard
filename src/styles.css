@@ -606,6 +606,56 @@ input[type="range"]::-webkit-slider-thumb {
 
 .feature-desc { font-size: 13px; color: var(--text-dim); line-height: 1.65; padding: 4px 0 8px; }
 
+.mini-tabs {
+  display: flex;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 2px;
+  gap: 2px;
+}
+.mini-tab {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 5px 10px;
+  border-radius: 7px;
+  cursor: pointer;
+  transition: 0.12s;
+}
+.mini-tab:hover { color: var(--text); }
+.mini-tab.active { background: var(--panel-2); color: var(--accent); }
+
+.screenshot-grid {
+  padding: 14px;
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 10px;
+  align-content: start;
+}
+.screenshot-tile {
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: var(--card);
+  cursor: pointer;
+  transition: 0.12s;
+}
+.screenshot-tile:hover { border-color: var(--accent); transform: translateY(-1px); }
+.screenshot-tile img { width: 100%; height: 90px; object-fit: cover; display: block; background: var(--bg-2); }
+.screenshot-tile .shot-time {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  padding: 5px 8px;
+  border-top: 1px solid var(--line-soft);
+}
+
 /* ---------- Activity log ---------- */
 .log {
   padding: 8px 8px 12px;

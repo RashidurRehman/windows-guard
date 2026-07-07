@@ -98,6 +98,12 @@ interface SyncEvent {
   pid: number;
 }
 
+interface ScreenshotInfo {
+  filename: string;
+  taken_at_ms: number;
+  data_uri: string;
+}
+
 interface TargetStatus {
   id: string;
   status: CaptureStatus;
@@ -736,6 +742,50 @@ function addSyncEventRow(evt: SyncEvent) {
   log.prepend(row);
   while (log.children.length > 200) log.lastChild?.remove();
   if (!$("#tab-sync").classList.contains("active")) $("#sync-tab-dot").classList.add("show");
+  if ($("#event-subtabs .mini-tab.active")?.getAttribute("data-subtab") === "screenshots") {
+    loadWebworkScreenshots();
+  }
+}
+
+function renderScreenshotGrid(shots: ScreenshotInfo[]) {
+  const grid = $("#sync-screenshots");
+  if (!shots.length) {
+    grid.innerHTML = `<div class="empty-state">No screenshots recovered yet — only WebWorkTracker captures are shown here (other trackers are detected but their images aren't accessible to us).</div>`;
+    return;
+  }
+  grid.innerHTML = "";
+  for (const shot of shots) {
+    const tile = document.createElement("div");
+    tile.className = "screenshot-tile";
+    tile.innerHTML = `<img src="${shot.data_uri}" alt="" loading="lazy" /><div class="shot-time">${fmtTime(shot.taken_at_ms)}</div>`;
+    tile.addEventListener("click", () => window.open(shot.data_uri, "_blank"));
+    grid.appendChild(tile);
+  }
+}
+
+async function loadWebworkScreenshots() {
+  const grid = $("#sync-screenshots");
+  grid.innerHTML = `<div class="empty-state">Loading…</div>`;
+  try {
+    const shots = await invoke<ScreenshotInfo[]>("list_webwork_screenshots", { limit: 24 });
+    renderScreenshotGrid(shots);
+  } catch (e) {
+    grid.innerHTML = `<div class="empty-state">Couldn't load screenshots: ${escapeHtml(String(e))}</div>`;
+  }
+}
+
+function wireEventSubtabs() {
+  $("#event-subtabs").querySelectorAll<HTMLButtonElement>(".mini-tab").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      $("#event-subtabs").querySelectorAll(".mini-tab").forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+      const sub = btn.dataset.subtab;
+      $("#sync-events").classList.toggle("hidden", sub !== "events");
+      $("#sync-screenshots").classList.toggle("hidden", sub !== "screenshots");
+      if (sub === "screenshots") loadWebworkScreenshots();
+    });
+  });
+  $("#open-screenshots-folder").addEventListener("click", () => invoke("open_webwork_screenshots_folder"));
 }
 
 // ---- Actions ----
@@ -977,6 +1027,7 @@ async function saveModal() {
 
 // ---- Wiring ----
 function wireSyncEvents() {
+  wireEventSubtabs();
   $("#sync-toggle").addEventListener("change", async (e) => {
     const el = e.target as HTMLInputElement;
     const on = el.checked;
