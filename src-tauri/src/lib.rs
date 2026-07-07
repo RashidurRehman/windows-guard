@@ -1095,10 +1095,13 @@ pub fn run() {
             push_log(&handle, "info", "Windows Guard started");
 
             // Exclude our own window from capture (we own it — direct, no injection).
+            // The window starts hidden (tauri.conf.json's "visible": false) so
+            // there's no race with Tauri's own default show-on-ready behavior;
+            // we explicitly show it here unless the user wants it minimized.
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.set_content_protected(protect_self);
-                if start_minimized {
-                    let _ = w.hide();
+                if !start_minimized {
+                    let _ = w.show();
                 }
             }
             Ok(())
