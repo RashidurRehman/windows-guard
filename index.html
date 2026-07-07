@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Windows Guard</title>
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 2.5 5 5.2v5.6c0 4.3 2.9 8.3 7 9.7 4.1-1.4 7-5.4 7-9.7V5.2L12 2.5Z" />
+              <path d="M9.2 12.2 11 14l4-4.2" />
+            </svg>
+          </div>
+          <div class="brand-text">
+            <h1>Windows Guard</h1>
+            <p class="tagline">Keep private apps out of recordings &amp; screenshots</p>
+          </div>
+        </div>
+
+        <div class="master" id="master">
+          <div class="master-text">
+            <span class="master-label" id="master-label">Protection</span>
+            <span class="master-sub" id="master-sub">Loading…</span>
+          </div>
+          <label class="switch switch-lg" title="Master protection switch">
+            <input type="checkbox" id="master-toggle" />
+            <span class="slider"></span>
+          </label>
+        </div>
+      </header>
+
+      <div class="body-row">
+        <nav class="icon-sidebar" id="tabs">
+          <button class="side-tab active" data-tab="protection" type="button" title="App Protection">
+            <span class="side-ico">🛡️</span>
+          </button>
+          <button class="side-tab" data-tab="sync" type="button" title="Sync Monitor">
+            <span class="side-ico">👁️</span><span class="tab-dot" id="sync-tab-dot"></span>
+          </button>
+          <button class="side-tab" data-tab="whatsapp" type="button" title="WhatsApp Privacy">
+            <span class="side-ico">💬</span>
+          </button>
+          <button class="side-tab" data-tab="activity" type="button" title="Activity Simulator">
+            <span class="side-ico">⌨️</span>
+          </button>
+          <button class="side-tab" data-tab="settings" type="button" title="Settings">
+            <span class="side-ico">⚙️</span>
+          </button>
+        </nav>
+
+        <div class="main-col">
+          <div id="fullscreen-banner" class="banner hidden">
+            ⚠ A full-screen app is running — capture protection can't apply to exclusive full-screen. Run games in <b>borderless / windowed</b> mode.
+          </div>
+
+          <main class="content">
+        <!-- ---------------- App Protection ---------------- -->
+        <section id="tab-protection" class="tab-panel active">
+          <section class="panel apps-panel grow">
+            <div class="panel-head">
+              <h2>Protected apps</h2>
+              <div class="head-actions">
+                <button id="refresh-btn" class="btn ghost small" title="Re-check now">↻ Refresh</button>
+                <button id="add-btn" class="btn primary small">+ Add app</button>
+              </div>
+            </div>
+            <div id="cards" class="cards"></div>
+          </section>
+        </section>
+
+        <!-- ---------------- Sync Monitor ---------------- -->
+        <section id="tab-sync" class="tab-panel">
+          <div class="split-2 fixed">
+            <section class="panel">
+              <div class="panel-head">
+                <h2>Sync Monitor</h2>
+                <label class="switch switch-lg"><input type="checkbox" id="sync-toggle" /><span class="slider"></span></label>
+              </div>
+              <div class="settings">
+                <div class="sync-status-card" id="sync-status-card">
+                  <div class="sync-status-row">
+                    <span class="sync-status-dot" id="sync-status-dot"></span>
+                    <div>
+                      <div class="sync-status-title" id="sync-status-title">Sync Monitor is off</div>
+                      <div class="sync-status-sub" id="sync-status-sub">Turn it on to watch for monitoring/tracker software</div>
+                    </div>
+                  </div>
+                  <div class="sync-stat-grid">
+                    <div class="sync-stat"><span id="sync-today-count">0</span><label>events today</label></div>
+                    <div class="sync-stat"><span id="sync-last-event">—</span><label>last event</label></div>
+                  </div>
+                </div>
+
+                <div class="setting">
+                  <div class="setting-text">
+                    <div class="s-title">Pause detection</div>
+                    <div class="s-sub">Manually stop watching until you resume</div>
+                  </div>
+                  <label class="switch"><input type="checkbox" id="sync-pause-toggle" /><span class="slider"></span></label>
+                </div>
+
+                <div class="setting column">
+                  <div class="setting-text">
+                    <div class="s-title">Meeting mode</div>
+                    <div class="s-sub">Pause for a set time, then resume automatically</div>
+                  </div>
+                  <div class="row-inline">
+                    <input type="number" id="sync-meeting-mins" min="1" max="480" value="30" />
+                    <span class="unit">minutes</span>
+                    <button id="sync-meeting-btn" type="button" class="btn ghost small">Start</button>
+                  </div>
+                </div>
+
+                <div class="setting column">
+                  <div class="setting-text">
+                    <div class="s-title">Spike threshold <span id="sync-threshold-val" class="pill-mini">300 KB</span></div>
+                    <div class="s-sub">Minimum RAM jump in a tracker process to count as a screenshot</div>
+                  </div>
+                  <input type="range" id="sync-threshold-range" min="50" max="5000" step="10" />
+                </div>
+
+                <div class="setting column">
+                  <div class="setting-text">
+                    <div class="s-title">Poll interval <span id="sync-interval-val" class="pill-mini">5s</span></div>
+                    <div class="s-sub">How often we check for tracker activity</div>
+                  </div>
+                  <input type="range" id="sync-interval-range" min="1" max="60" step="1" />
+                </div>
+
+                <div class="setting column">
+                  <div class="setting-text">
+                    <div class="s-title">Cooldown <span id="sync-cooldown-val" class="pill-mini">2s</span></div>
+                    <div class="s-sub">Minimum time between two alerts</div>
+                  </div>
+                  <input type="range" id="sync-cooldown-range" min="0" max="60" step="1" />
+                </div>
+
+                <div class="setting column">
+                  <div class="setting-text">
+                    <div class="s-title">Quiet hours <em>(optional)</em></div>
+                    <div class="s-sub">Log silently without alerting during this window</div>
+                  </div>
+                  <div class="row-inline">
+                    <input type="time" id="sync-quiet-from" />
+                    <span class="unit">to</span>
+                    <input type="time" id="sync-quiet-to" />
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-head"><h2>Watched trackers</h2></div>
+              <div class="settings">
+                <div class="field">
+                  <span>Known trackers <em>(built-in)</em></span>
+                  <div id="known-trackers-list" class="key-chip-list"></div>
+                </div>
+                <div class="field">
+                  <span>Custom trackers</span>
+                  <div id="custom-trackers-list" class="key-chip-list"></div>
+                  <div class="row-inline">
+                    <input type="text" id="tracker-add-input" placeholder="e.g. MyTrackerApp" autocomplete="off" />
+                    <button id="tracker-add-btn" type="button" class="btn ghost small">+ Add</button>
+                  </div>
+                  <p id="tracker-error" class="modal-error hidden"></p>
+                </div>
+              </div>
+            </section>
+          </div>
+
+          <section class="panel event-panel">
+            <div class="panel-head">
+              <h2>Screenshot events</h2>
+              <button id="sync-clear-events" class="btn ghost small">Clear</button>
+            </div>
+            <div id="sync-events" class="log"></div>
+          </section>
+        </section>
+
+        <!-- ---------------- WhatsApp Privacy ---------------- -->
+        <section id="tab-whatsapp" class="tab-panel">
+          <section class="panel grow">
+            <div class="panel-head">
+              <h2>WhatsApp Privacy Blur <span id="wablur-status" class="pill-mini">off</span></h2>
+              <label class="switch switch-lg"><input type="checkbox" id="veil-toggle" /><span class="slider"></span></label>
+            </div>
+            <div class="settings">
+              <p class="feature-desc">
+                Blurs chats, messages and the header inside WhatsApp's own window against shoulder-surfing,
+                revealing only what's hovered. This works independently of capture-hiding — even with this off,
+                WhatsApp can still be excluded from screen recordings via the App Protection tab.
+              </p>
+            </div>
+          </section>
+        </section>
+
+        <!-- ---------------- Activity Simulator ---------------- -->
+        <section id="tab-activity" class="tab-panel">
+          <section class="panel grow">
+            <div class="panel-head">
+              <h2>Activity Simulator <span id="activity-status" class="pill-mini">off</span></h2>
+              <label class="switch switch-lg"><input type="checkbox" id="activity-toggle" /><span class="slider"></span></label>
+            </div>
+            <div class="settings">
+              <p class="feature-desc">
+                After a period of no real user input, presses a short burst of harmless keys so idle detectors,
+                away-status timers and screensavers see genuine input — no character is typed, no window is
+                affected, and real input aborts a burst immediately.
+              </p>
+              <button id="activity-configure" type="button" class="btn ghost wide">Configure keys &amp; timing</button>
+            </div>
+          </section>
+        </section>
+
+        <!-- ---------------- Settings ---------------- -->
+        <section id="tab-settings" class="tab-panel">
+          <div class="split-2 grow">
+            <section class="panel">
+              <div class="panel-head"><h2>General</h2></div>
+              <div class="settings">
+                <div class="setting">
+                  <div class="setting-text">
+                    <div class="s-title">Start on Windows login</div>
+                    <div class="s-sub">Launch &amp; protect automatically</div>
+                  </div>
+                  <label class="switch"><input type="checkbox" id="autostart-toggle" /><span class="slider"></span></label>
+                </div>
+                <div class="setting">
+                  <div class="setting-text">
+                    <div class="s-title">Start minimized to tray</div>
+                    <div class="s-sub">Open hidden in the background</div>
+                  </div>
+                  <label class="switch"><input type="checkbox" id="startmin-toggle" /><span class="slider"></span></label>
+                </div>
+                <div class="setting">
+                  <div class="setting-text">
+                    <div class="s-title">Protect Windows Guard itself</div>
+                    <div class="s-sub">Exclude this window from screen capture too</div>
+                  </div>
+                  <label class="switch"><input type="checkbox" id="self-toggle" /><span class="slider"></span></label>
+                </div>
+                <div class="setting">
+                  <div class="setting-text">
+                    <div class="s-title">Elevated mode <span id="elev-status" class="pill-mini">—</span></div>
+                    <div class="s-sub">Auto-start elevated at logon — protects admin apps &amp; broad coverage. One-time admin approval.</div>
+                  </div>
+                  <label class="switch"><input type="checkbox" id="elev-toggle" /><span class="slider"></span></label>
+                </div>
+                <button id="elev-restart" class="btn ghost wide hidden">Restart elevated now</button>
+                <div class="setting column">
+                  <div class="setting-text">
+                    <div class="s-title">Safety re-check interval <span id="interval-val" class="pill-mini">15s</span></div>
+                    <div class="s-sub">Backstop only — new windows are protected instantly by the event watcher</div>
+                  </div>
+                  <input type="range" id="interval-range" min="3" max="60" step="1" value="15" />
+                </div>
+                <button id="open-folder" class="btn ghost wide">Open config &amp; scripts folder</button>
+              </div>
+            </section>
+
+            <section class="panel log-panel">
+              <div class="panel-head">
+                <h2>System log</h2>
+                <button id="clear-log" class="btn ghost small">Clear</button>
+              </div>
+              <div id="log" class="log"></div>
+            </section>
+          </div>
+        </section>
+          </main>
+        </div>
+      </div>
+    </div>
+
+    <div id="modal" class="modal hidden">
+      <div class="modal-card modal-lg">
+        <div class="modal-head">
+          <h3 id="modal-title">Add an app to protect</h3>
+          <button id="modal-close" class="icon-btn" aria-label="Close">✕</button>
+        </div>
+
+        <!-- Step 1: browse installed apps -->
+        <div id="step-browse" class="modal-body browse-body">
+          <div class="search-row">
+            <span class="search-ico" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.2-3.2"/></svg>
+            </span>
+            <input type="text" id="app-search" class="search-input" placeholder="Search installed apps…" autocomplete="off" />
+            <button id="app-refresh" class="icon-btn" title="Rescan installed apps">↻</button>
+          </div>
+          <div id="app-grid" class="app-grid"></div>
+          <div class="browse-foot">
+            <span id="app-count" class="muted"></span>
+            <button id="manual-link" class="link-btn">Can't find it? Add manually</button>
+          </div>
+        </div>
+
+        <!-- Step 2: configure the selected app -->
+        <div id="step-config" class="modal-body hidden">
+          <div id="sel-app" class="selected-app">
+            <img id="sel-icon" class="sel-icon" alt="" />
+            <div class="sel-meta">
+              <div id="sel-name-lbl" class="sel-name">App</div>
+              <div id="sel-proc-lbl" class="sel-proc"></div>
+            </div>
+          </div>
+          <label class="field">
+            <span>Display name</span>
+            <input type="text" id="f-name" placeholder="e.g. Signal" autocomplete="off" />
+          </label>
+          <label class="field">
+            <span>Process name <em>(without .exe)</em></span>
+            <div class="row-inline">
+              <input type="text" id="f-process" placeholder="e.g. Signal" autocomplete="off" />
+              <button type="button" id="f-detect" class="btn ghost small" title="Detect the app type and best method">Detect</button>
+            </div>
+          </label>
+          <div id="detect-hint" class="detect-hint hidden"></div>
+          <label class="field">
+            <span>Protection method</span>
+            <select id="f-method">
+              <option value="electron-patch">Electron self-patch (best for Electron apps)</option>
+              <option value="inject">Injection show-through (non-Electron apps &amp; games)</option>
+              <option value="hide-during-capture">Hide during capture (no injection, safer)</option>
+            </select>
+          </label>
+          <button type="button" id="adv-toggle" class="link-btn">Advanced options ▾</button>
+          <div id="adv" class="advanced hidden">
+            <label class="field">
+              <span>Window class filter <em>(optional)</em></span>
+              <input type="text" id="f-class" placeholder="e.g. Chrome_WidgetWin_1" autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>Title contains <em>(optional)</em></span>
+              <input type="text" id="f-title" placeholder="e.g. Private" autocomplete="off" />
+            </label>
+            <label class="check">
+              <input type="checkbox" id="f-all" />
+              <span>Include hidden / untitled windows (floating widgets, overlays)</span>
+            </label>
+          </div>
+          <p id="modal-error" class="modal-error hidden"></p>
+        </div>
+
+        <div class="modal-foot">
+          <button id="back-btn" class="btn ghost hidden">← Back</button>
+          <div class="foot-spacer"></div>
+          <button id="modal-cancel" class="btn ghost">Cancel</button>
+          <button id="modal-save" class="btn primary hidden">Add app</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="activity-modal" class="modal hidden">
+      <div class="modal-card modal-lg">
+        <div class="modal-head">
+          <h3>Activity simulator</h3>
+          <button id="activity-modal-close" class="icon-btn" aria-label="Close">✕</button>
+        </div>
+        <div class="modal-body activity-body">
+          <label class="field">
+            <span>Trigger after inactivity for</span>
+            <div class="row-inline">
+              <input type="number" id="act-idle" min="5" max="3600" step="1" />
+              <span class="unit">seconds</span>
+            </div>
+          </label>
+          <label class="field">
+            <span>Keys per burst</span>
+            <input type="number" id="act-keys" min="1" max="30" step="1" />
+          </label>
+          <div class="field">
+            <span>Delay between presses</span>
+            <div class="row-inline">
+              <input type="number" id="act-gap-min" min="20" max="5000" step="10" />
+              <span class="unit">to</span>
+              <input type="number" id="act-gap-max" min="20" max="5000" step="10" />
+              <span class="unit">ms</span>
+            </div>
+          </div>
+          <div class="field">
+            <span>How long each key is held</span>
+            <div class="row-inline">
+              <input type="number" id="act-hold-min" min="10" max="1000" step="5" />
+              <span class="unit">to</span>
+              <input type="number" id="act-hold-max" min="10" max="1000" step="5" />
+              <span class="unit">ms</span>
+            </div>
+          </div>
+          <div class="field">
+            <span>Safe keys <em>(one is picked at random each press)</em></span>
+            <div id="safe-keys-list" class="key-chip-list"></div>
+            <button type="button" id="act-record-btn" class="btn ghost small">+ Record a key</button>
+            <div id="act-recorder" class="recorder hidden">
+              <span>Press a key or combo now… <em>(Shift, Ctrl, Alt, Win, Scroll Lock, Caps Lock, Num Lock, Pause, F13–F24)</em></span>
+              <button type="button" id="act-record-cancel" class="link-btn">Cancel</button>
+            </div>
+            <p id="act-error" class="modal-error hidden"></p>
+          </div>
+        </div>
+        <div class="modal-foot">
+          <div class="foot-spacer"></div>
+          <button id="activity-modal-cancel" class="btn ghost">Close</button>
+          <button id="activity-modal-save" class="btn primary">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

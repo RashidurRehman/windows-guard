@@ -1,0 +1,67 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Windows Guard overlay</title>
+    <style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        background: transparent;
+        overflow: hidden;
+        user-select: none;
+      }
+      #shape {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        width: 22px;
+        height: 22px;
+        border-radius: 50%;
+        transform: translate(-50%, -50%) scale(0.6);
+        opacity: 0;
+        box-shadow: 0 0 16px 4px currentColor;
+      }
+      #shape.on {
+        opacity: 1;
+        transform: translate(-50%, -50%) scale(1);
+        transition: opacity 90ms ease-out, transform 90ms ease-out;
+      }
+      #shape.off {
+        opacity: 0;
+        transform: translate(-50%, -50%) scale(0.6);
+        transition: opacity 110ms ease-in, transform 110ms ease-in;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="shape"></div>
+    <script type="module">
+      import { listen } from "@tauri-apps/api/event";
+
+      const shape = document.getElementById("shape");
+
+      async function blink(payload) {
+        const color = payload?.color || "#3ddc97";
+        const count = Math.min(5, Math.max(1, payload?.blink_count ?? 3));
+        const onMs = payload?.on_ms ?? 180;
+        const offMs = payload?.off_ms ?? 130;
+        shape.style.color = color;
+        shape.style.background = color;
+
+        for (let i = 0; i < count; i++) {
+          shape.classList.remove("off");
+          shape.classList.add("on");
+          await new Promise((r) => setTimeout(r, onMs));
+          shape.classList.remove("on");
+          shape.classList.add("off");
+          await new Promise((r) => setTimeout(r, offMs));
+        }
+      }
+
+      listen("blink-trigger", (e) => blink(e.payload));
+    </script>
+  </body>
+</html>

@@ -1,0 +1,26 @@
+[package]
+name = "windows-guard-hook"
+version = "0.1.0"
+description = "Windows Guard in-process capture-protection helper (loaded via SetWindowsHookEx)"
+edition = "2021"
+
+[lib]
+name = "windows_guard_hook"
+crate-type = ["cdylib"]
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Accessibility",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

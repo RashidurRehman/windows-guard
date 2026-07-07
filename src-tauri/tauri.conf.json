@@ -1,0 +1,54 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Windows Guard",
+  "version": "0.1.0",
+  "identifier": "com.rashid.capture-guard",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "Windows Guard",
+        "width": 960,
+        "height": 700,
+        "minWidth": 820,
+        "minHeight": 560,
+        "resizable": true,
+        "center": true,
+        "contentProtected": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "publisher": "Windows Guard",
+    "copyright": "Copyright © 2026 Windows Guard. All rights reserved.",
+    "category": "Utility",
+    "shortDescription": "Keep private apps out of screen recordings and screenshots.",
+    "longDescription": "Windows Guard is a lightweight Windows tray app that keeps the apps you choose (WhatsApp, browsers, editors, games and more) excluded from screen recordings and screenshots, while they stay fully visible to you. It auto-starts at logon, self-heals when an app restarts, and covers the main window, floating widgets, and owned dialogs/popups.",
+    "homepage": "https://github.com/DevBilall/capture-guard",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "digestAlgorithm": "sha256",
+      "certificateThumbprint": "7FC8720FE434569926BD7E1EF9075F04A1C7A2AF",
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
+  }
+}

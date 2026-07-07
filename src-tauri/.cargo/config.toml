@@ -1,0 +1,4 @@
+# Keep the heavy Rust build artifacts OUT of the OneDrive-synced project folder.
+# OneDrive would otherwise try to sync gigabytes of incremental build output.
+[build]
+target-dir = "C:/Users/urreh/AppData/Local/capture-guard-build"
