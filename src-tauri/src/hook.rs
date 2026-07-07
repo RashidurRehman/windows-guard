@@ -34,6 +34,7 @@ enum Cmd {
     Protect(u32),
     Unprotect(u32),
     Prune(HashSet<u32>),
+    UnhookAll(Sender<()>),
 }
 
 static TX: OnceLock<Sender<Cmd>> = OnceLock::new();
@@ -112,6 +113,21 @@ pub fn init() -> Result<(), String> {
                         }
                     });
                 }
+                Cmd::UnhookAll(ack) => {
+                    // SetWindowsHookEx explicitly documents that the installing
+                    // process must UnhookWindowsHookEx before it terminates —
+                    // an abrupt process::exit() while hooks are still mapped
+                    // into another process (e.g. Cursor, via the ElectronPatch
+                    // belt-and-suspenders hook below) can destabilize that
+                    // process if it's mid-dispatch through the hook chain.
+                    for threads in hooks.values() {
+                        for hook in threads.values() {
+                            unsafe { let _ = UnhookWindowsHookEx(*hook); }
+                        }
+                    }
+                    hooks.clear();
+                    let _ = ack.send(());
+                }
             }
         }
     });
@@ -162,6 +178,18 @@ pub fn unprotect_target(process: &str) {
 pub fn prune_dead(alive: HashSet<u32>) {
     if let Some(tx) = TX.get() {
         let _ = tx.send(Cmd::Prune(alive));
+    }
+}
+
+/// Cleanly `UnhookWindowsHookEx` every hook we've installed in every target
+/// process, and wait (briefly) for confirmation. MUST be called before this
+/// process exits — see the note on `Cmd::UnhookAll`. Bounded wait so a stuck
+/// owner thread can't hang shutdown indefinitely.
+pub fn shutdown() {
+    let Some(tx) = TX.get() else { return };
+    let (ack_tx, ack_rx) = mpsc::channel();
+    if tx.send(Cmd::UnhookAll(ack_tx)).is_ok() {
+        let _ = ack_rx.recv_timeout(std::time::Duration::from_millis(1500));
     }
 }
 

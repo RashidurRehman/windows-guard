@@ -587,6 +587,7 @@ async function onRestartToUpdate() {
   btn.disabled = true;
   btn.textContent = "Installing…";
   try {
+    await invoke("prepare_for_update_install");
     await pendingUpdate.install();
     await relaunch();
   } catch (e) {

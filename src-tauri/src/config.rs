@@ -305,46 +305,12 @@ impl Default for Config {
     }
 }
 
-/// The apps we ship protection for out of the box.
+/// No apps are pre-added — a fresh install starts with an empty list so the
+/// user has full control over exactly what gets protected. Previously this
+/// shipped WhatsApp/Brave/Cursor as opinionated defaults, which isn't
+/// appropriate for machines that don't even have those apps installed.
 pub fn default_targets() -> Vec<Target> {
-    vec![
-        Target {
-            id: "whatsapp".into(),
-            name: "WhatsApp".into(),
-            method: Method::Inject,
-            process: "WhatsApp.Root".into(),
-            class: "WinUIDesktopWin32WindowClass".into(),
-            title: String::new(),
-            all_windows: false,
-            enabled: true,
-            builtin: true,
-            show_icon: false,
-        },
-        Target {
-            id: "brave".into(),
-            name: "Brave Browser".into(),
-            method: Method::Inject,
-            process: "brave".into(),
-            class: String::new(),
-            title: String::new(),
-            all_windows: false,
-            enabled: true,
-            builtin: true,
-            show_icon: false,
-        },
-        Target {
-            id: "cursor".into(),
-            name: "Cursor".into(),
-            method: Method::ElectronPatch,
-            process: "Cursor".into(),
-            class: String::new(),
-            title: String::new(),
-            all_windows: false,
-            enabled: true,
-            builtin: true,
-            show_icon: false,
-        },
-    ]
+    Vec::new()
 }
 
 impl Config {

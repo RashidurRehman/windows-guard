@@ -494,9 +494,21 @@ fn set_elevated_mode(app: AppHandle, enabled: bool) -> Result<bool, String> {
 fn restart_elevated(app: AppHandle) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     elevate::restart_elevated(&exe)?;
-    // The elevated instance is starting; step aside.
+    // The elevated instance is starting; step aside. Unhook first — see the
+    // note on hook::shutdown().
+    hook::shutdown();
     app.exit(0);
     Ok(())
+}
+
+/// Called by the frontend right before `update.install()`, which exits this
+/// process internally (inside the updater plugin) to let the installer
+/// replace the exe. Our own code never gets a chance to run after that
+/// happens, so hooks must be cleanly removed here, first — see the note on
+/// `hook::shutdown()`.
+#[tauri::command]
+fn prepare_for_update_install() {
+    hook::shutdown();
 }
 
 #[tauri::command]
@@ -897,6 +909,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                 let _ = set_master(app.clone(), !enabled);
             }
             "quit" => {
+                hook::shutdown();
                 wablur::shutdown();
                 app.exit(0);
             }
@@ -937,6 +950,7 @@ pub fn run() {
             set_target_enabled,
             set_target_show_icon,
             focus_main_window,
+            prepare_for_update_install,
             protect_now,
             unprotect_now,
             add_target,
