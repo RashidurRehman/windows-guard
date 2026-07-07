@@ -35,7 +35,7 @@
     "category": "Utility",
     "shortDescription": "Keep private apps out of screen recordings and screenshots.",
     "longDescription": "Windows Guard is a lightweight Windows tray app that keeps the apps you choose (WhatsApp, browsers, editors, games and more) excluded from screen recordings and screenshots, while they stay fully visible to you. It auto-starts at logon, self-heals when an app restarts, and covers the main window, floating widgets, and owned dialogs/popups.",
-    "homepage": "https://github.com/urrehmanr/windows-guard",
+    "homepage": "https://github.com/RashidurRehman/windows-guard",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -56,7 +56,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDlGODA5NzZBRDE0OTc5MTUKUldRVmVVblJhcGVBbi84Mkk5VXVMVVlTZ1VxL0dCUWJZeFlINWlMbFpRYVF5cVJrZFBwb1cveWcK",
       "endpoints": [
-        "https://github.com/urrehmanr/windows-guard/releases/latest/download/latest.json"
+        "https://github.com/RashidurRehman/windows-guard/releases/latest/download/latest.json"
       ]
     }
   }
