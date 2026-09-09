@@ -4,7 +4,9 @@ A lightweight Windows tray app (Tauri + Rust) that keeps your private apps —
 WhatsApp, Brave, Cursor, and anything you add — **out of screen recordings and
 screenshots**, while they stay fully visible to you ("show-through"). It starts
 at logon, protects on startup, and **self-heals**: when a protected app is closed
-and reopened, protection is re-applied automatically within a few seconds.
+and reopened, protection is re-applied automatically — normally in well under a
+second, because a window-show hook reacts as the window appears, with a periodic
+re-check every 15 seconds as a safety backstop if that hook ever misses one.
 
 It also includes **Sync Monitor** (detects employee-monitoring/tracker software
 taking a screenshot and alerts you), a **WhatsApp privacy blur**, an **activity
@@ -97,8 +99,11 @@ Toggle it in **Settings → Privacy veil (WhatsApp)**.
   - `actions.rs` — turns protection on/off per target: drives `hook.rs` for the
     signed-DLL method, plus the remaining (non-injection) PowerShell helpers for the
     Electron self-patch, app listing, and icons.
-  - `monitor.rs` — the self-healing loop: probes each app every few seconds and
-    re-applies protection when needed, with per-method cooldowns.
+  - `monitor.rs` — the self-healing backstop: every `interval_secs` (default 15)
+    it probes each app and re-applies protection when needed, with per-method
+    cooldowns. It also checks the Electron self-patch marker on disk, so a patch
+    wiped by an app update is caught even while the still-running instance keeps
+    reporting itself protected. `events.rs` is the fast path ahead of it.
   - `config.rs` — the persisted config (apps, methods, settings, privacy veil).
   - `lib.rs` — Tauri commands, tray icon, autostart, window-to-tray behavior.
 - **Signed helper DLL** (`hook-dll/`, crate `captureguard-hook`) — the tiny in-process

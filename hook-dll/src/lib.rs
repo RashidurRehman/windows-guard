@@ -136,7 +136,7 @@ fn substantial(h: HWND) -> bool {
 /// instant they appear. OUTOFCONTEXT events are delivered on the thread that
 /// installed the hook (the hooked GUI thread), via its normal message loop.
 fn install_watcher() {
-    if WATCHER.load(Ordering::Relaxed) != 0 {
+    if WATCHER.load(Ordering::Acquire) != 0 {
         return;
     }
     let me = unsafe { GetCurrentProcessId() };
@@ -151,11 +151,24 @@ fn install_watcher() {
             WINEVENT_OUTOFCONTEXT,
         )
     };
-    WATCHER.store(hook.0 as isize, Ordering::Relaxed);
+    if hook.0.is_null() {
+        return;
+    }
+    // Claim the slot atomically: two GUI threads can enter here at once, and a
+    // plain store would orphan the loser's hook — a leaked handle inside the
+    // user's browser, which we never get another chance to release.
+    if WATCHER
+        .compare_exchange(0, hook.0 as isize, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        unsafe {
+            let _ = UnhookWinEvent(hook);
+        }
+    }
 }
 
 fn remove_watcher() {
-    let raw = WATCHER.swap(0, Ordering::Relaxed);
+    let raw = WATCHER.swap(0, Ordering::AcqRel);
     if raw != 0 {
         unsafe {
             let _ = UnhookWinEvent(HWINEVENTHOOK(raw as *mut c_void));

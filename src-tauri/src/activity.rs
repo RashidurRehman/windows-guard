@@ -37,6 +37,52 @@ pub const VK_RMENU: u16 = 0xA5;
 pub const VK_LWIN: u16 = 0x5B;
 pub const VK_RWIN: u16 = 0x5C;
 
+/// Every virtual-key the simulator is ever allowed to press: modifiers, lock
+/// keys, Pause, and F13-F24. What they have in common is that none of them
+/// types a character or activates anything on its own, so a burst is invisible
+/// no matter which window has focus.
+///
+/// This mirrors `ACTIVITY_KEY_MAP` in `src/main.ts`, which restricts what the
+/// key recorder will accept. That UI check used to be the ONLY thing standing
+/// between the simulator and a printable key: `validate_combo` rejected just
+/// bare Alt/Win, so a hand-edited `config.json` (or any other path that reaches
+/// the config without going through the recorder) could install e.g. `A` or
+/// `Enter` as a "safe" key and have it typed into whatever the user had in
+/// focus. Keep the two lists in sync; this one is authoritative.
+const ALLOWED_VKS: &[u16] = &[
+    0xA0, 0xA1, // Shift L/R
+    0xA2, 0xA3, // Ctrl L/R
+    0xA4, 0xA5, // Alt L/R
+    0x5B, 0x5C, // Win L/R
+    0x91, // Scroll Lock
+    0x14, // Caps Lock
+    0x90, // Num Lock
+    0x13, // Pause
+    // F13-F24: not present on normal keyboards and unbound by default.
+    0x7C, 0x7D, 0x7E, 0x7F, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
+];
+
+fn vk_allowed(vk: u16) -> bool {
+    ALLOWED_VKS.contains(&vk)
+}
+
+/// Drop any safe key holding a virtual-key outside `ALLOWED_VKS`, or that
+/// `validate_combo` rejects. Applied to whatever comes off disk, because the
+/// config is deserialized straight into `ActivityConfig` with no validation of
+/// its own — an edited or hand-written file would otherwise be trusted.
+/// Returns the labels that were dropped so the caller can log them.
+pub fn sanitize_safe_keys(cfg: &mut ActivityConfig) -> Vec<String> {
+    let mut dropped = Vec::new();
+    cfg.safe_keys.retain(|k| {
+        if validate_combo(&k.vks).is_ok() {
+            return true;
+        }
+        dropped.push(k.label.clone());
+        false
+    });
+    dropped
+}
+
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static LAST_IDLE_MS: AtomicU64 = AtomicU64::new(0);
 static LAST_BURST_TICK: AtomicU64 = AtomicU64::new(0);
@@ -48,9 +94,25 @@ pub struct ActivityStatus {
     pub threshold_secs: u64,
 }
 
+/// Snapshot the activity settings. Recovers from a poisoned config mutex
+/// instead of unwrapping: this runs on a supervisor thread that must live for
+/// the whole session, and a panic in any OTHER holder of the lock would
+/// otherwise take this thread down with it — silently, leaving the UI showing
+/// the last status it emitted forever.
 fn config_snapshot(app: &AppHandle) -> ActivityConfig {
     let st = app.state::<crate::AppState>();
-    let cfg = st.config.lock().unwrap().activity.clone();
+    let guard = st.config.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cfg = guard.activity.clone();
+    drop(guard);
+    // Enforce the allowlist on every read rather than once at load. The config
+    // is deserialized straight from disk with no validation, so a hand-edited
+    // file could otherwise install a printable key; and this is the only path
+    // by which the simulator ever obtains its key list, so nothing can reach
+    // `do_burst` without passing through here.
+    let dropped = sanitize_safe_keys(&mut cfg);
+    if !dropped.is_empty() {
+        dbg(&format!("dropped disallowed safe keys: {}", dropped.join(", ")));
+    }
     cfg
 }
 
@@ -64,6 +126,16 @@ pub fn set_enabled(enabled: bool) {
 pub fn validate_combo(vks: &[u16]) -> Result<(), String> {
     if vks.is_empty() {
         return Err("Pick at least one key".into());
+    }
+    // Anything that can type a character or trigger an action is refused
+    // outright, whatever it is combined with — a burst goes to whichever
+    // window happens to have focus, so this is the check that keeps the
+    // simulator from typing into the user's documents, chats or password
+    // fields.
+    if let Some(bad) = vks.iter().copied().find(|vk| !vk_allowed(*vk)) {
+        return Err(format!(
+            "Key 0x{bad:02X} can type or trigger something — only modifiers, lock keys, Pause and F13-F24 are allowed"
+        ));
     }
     if vks.len() == 1 {
         let vk = vks[0];
@@ -89,6 +161,32 @@ fn idle_ms() -> u64 {
     }
     let now = unsafe { GetTickCount() };
     now.wrapping_sub(lii.dwTime) as u64
+}
+
+/// Tick of the most recent system-wide input event, from the same clock as
+/// `GetTickCount`.
+fn last_input_tick() -> u64 {
+    let mut lii = LASTINPUTINFO {
+        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    unsafe {
+        let _ = GetLastInputInfo(&mut lii);
+    }
+    lii.dwTime as u64
+}
+
+/// True when the system has seen input that cannot be accounted for by our own
+/// last injected key. `SendInput` updates the same last-input timestamp the
+/// user's typing does, so we allow a small window around our own injection and
+/// treat anything newer than that as genuine user input.
+fn real_input_since_our_last_inject() -> bool {
+    const SLACK_MS: u64 = 60;
+    let ours = LAST_INJECT_TICK.load(Ordering::Relaxed);
+    if ours == 0 {
+        return false;
+    }
+    last_input_tick().wrapping_sub(ours) > SLACK_MS
 }
 
 /// Is the current foreground window a dialog/popup? We deliberately skip
@@ -121,6 +219,17 @@ fn foreground_is_dialog() -> bool {
 
 // --- input simulation --------------------------------------------------------
 
+/// Marker stamped into `dwExtraInfo` on every key we synthesise. `GetLastInputInfo`
+/// cannot tell our input from the user's — both just bump the same timestamp —
+/// so instead of trying to read intent out of the idle clock we record what we
+/// injected ourselves and compare against that. Value is arbitrary; it only has
+/// to be unlikely to collide with another tool's marker.
+const CG_INJECTED_TAG: usize = 0x4347_4143;
+
+/// `GetTickCount` at the moment we last injected a key. Anything that moves the
+/// idle clock without matching this is the user.
+static LAST_INJECT_TICK: AtomicU64 = AtomicU64::new(0);
+
 fn send_key(vk: u16, key_up: bool) {
     let flags: KEYBD_EVENT_FLAGS = if key_up {
         KEYEVENTF_KEYUP
@@ -135,13 +244,14 @@ fn send_key(vk: u16, key_up: bool) {
                 wScan: 0,
                 dwFlags: flags,
                 time: 0,
-                dwExtraInfo: 0,
+                dwExtraInfo: CG_INJECTED_TAG,
             },
         },
     };
     unsafe {
         SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
     }
+    LAST_INJECT_TICK.store(unsafe { GetTickCount() } as u64, Ordering::Relaxed);
 }
 
 fn press_combo(vks: &[u16], hold_ms: u64) {
@@ -175,7 +285,6 @@ fn do_burst(cfg: &ActivityConfig) {
     let n = rng.gen_range(base.saturating_sub(1).max(1)..=(base + 2));
 
     for _ in 0..n {
-        let idle_before = idle_ms();
         let key = &cfg.safe_keys[rng.gen_range(0..cfg.safe_keys.len())];
         let hold = rand_range(&mut rng, cfg.hold_min_ms, cfg.hold_max_ms);
         press_combo(&key.vks, hold);
@@ -183,11 +292,15 @@ fn do_burst(cfg: &ActivityConfig) {
         let gap = rand_range(&mut rng, cfg.press_gap_min_ms, cfg.press_gap_max_ms);
         std::thread::sleep(Duration::from_millis(gap));
 
-        // If idle time jumped up instead of resetting near 0, or a burst of
-        // real input landed in the gap, someone's actually using the machine —
-        // stop immediately rather than fighting them.
-        let idle_after = idle_ms();
-        if idle_after > idle_before && idle_after > gap + hold + 50 {
+        // Did anything OTHER than our own press touch the input clock during
+        // that gap? `GetLastInputInfo` is updated by our SendInput too, so the
+        // previous comparison of idle-before vs idle-after could never fire:
+        // after a press idle_ms() is ~0 whether the last event was ours or the
+        // user's. Comparing the last-input timestamp against the tick of our
+        // own last injection separates the two — if the machine saw input
+        // measurably newer than anything we sent, the user is back, so stop
+        // rather than fighting them for the keyboard.
+        if real_input_since_our_last_inject() {
             return;
         }
     }

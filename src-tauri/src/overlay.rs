@@ -45,6 +45,10 @@ fn ensure_window(app: &AppHandle) -> Option<WebviewWindow> {
         .visible(false)
         .resizable(false)
         .focused(false)
+        // The alert itself must not appear in a capture: it fires exactly when
+        // something is capturing the screen, so an unprotected overlay would
+        // announce to that observer that they have been detected.
+        .content_protected(true)
         .build()
         .ok()
 }

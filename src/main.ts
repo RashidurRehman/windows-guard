@@ -6,7 +6,15 @@ import { relaunch } from "@tauri-apps/plugin-process";
 
 // ---- Types mirroring the Rust payloads ----
 type Method = "inject" | "electron-patch" | "hide-during-capture";
-type CaptureStatus = "not-running" | "protected" | "partial" | "unprotected";
+type CaptureStatus =
+  | "not-running"
+  | "protected"
+  | "partial"
+  | "unprotected"
+  // Running, but no window is countable: tray-minimized (benign) OR we cannot
+  // see its windows at all (UIPI/session mismatch, renamed exe) — possible
+  // exposure. Never present this as reassuring.
+  | "unknown";
 
 interface Target {
   id: string;
@@ -104,6 +112,17 @@ interface ScreenshotInfo {
   data_uri: string;
 }
 
+// Whether the on-disk Electron patch that KEEPS a target protected is still
+// there. Separate from CaptureStatus, which says what the windows are doing
+// right now: an app update can silently revert the patch while the still-running
+// process keeps its protection, so the next launch is capturable.
+type PatchState = "not-applicable" | "absent" | "pending-restart" | "active";
+
+interface PatchStateEntry {
+  id: string;
+  patch_state: PatchState;
+}
+
 interface TargetStatus {
   id: string;
   status: CaptureStatus;
@@ -117,6 +136,15 @@ interface LogEntry {
   message: string;
 }
 
+// Backend health of the protection engine. Optional on the wire: older builds
+// (and any build where the Rust side hasn't shipped the field yet) simply omit
+// it, and an absent value is treated as Ready so the UI behaves exactly as it
+// did before. See applyEngineHealth().
+type EngineHealth =
+  | { state: "ready" }
+  | { state: "unavailable"; reason: string }
+  | { state: "degraded"; reason: string };
+
 interface FullState {
   config: Config;
   statuses: TargetStatus[];
@@ -125,10 +153,95 @@ interface FullState {
   elevated_task_installed: boolean;
   fullscreen_active: boolean;
   log: LogEntry[];
+  engine_health?: EngineHealth;
+  // Present when the saved config could not be read normally at startup —
+  // corrupt (renamed aside and reset to defaults) or unreadable (defaults used
+  // in memory, the file left untouched). Either way the user is running with
+  // settings they did not choose, which is silent state loss they should see
+  // rather than have to find in the log pane. Optional: older backends omit it.
+  config_notice?: string | null;
 }
 
 function setFullscreenBanner(on: boolean) {
   $("#fullscreen-banner").classList.toggle("hidden", !on);
+}
+
+// ---- Engine health ----
+// The single source of truth for "is protection actually working". Deliberately
+// NOT derived from the log stream: log rows are wiped on every renderLog() and
+// aren't persisted before the backend's state is managed, so a banner driven by
+// them can miss the very error it exists to show.
+let engineHealth: EngineHealth = { state: "ready" };
+
+function applyEngineHealth(h: EngineHealth | undefined) {
+  // Absent field (older backend) => assume ready; never invent a failure.
+  engineHealth = h ?? { state: "ready" };
+  const banner = $("#engine-banner");
+  const title = $("#engine-banner-title");
+  const reason = $("#engine-banner-reason");
+
+  if (engineHealth.state === "ready") {
+    banner.classList.add("hidden");
+    return;
+  }
+
+  const degraded = engineHealth.state === "degraded";
+  banner.classList.toggle("banner-degraded", degraded);
+  banner.classList.toggle("banner-error", !degraded);
+  title.textContent = degraded
+    ? "Protection is only partly working."
+    : "Protection engine unavailable — your apps are NOT protected.";
+  // textContent, never innerHTML: this string is a Rust error carrying OS text.
+  reason.textContent = engineHealth.reason ?? "";
+  banner.classList.remove("hidden");
+  renderMaster();
+}
+
+// ---- Config notice ----
+// Shown when the saved config could not be read at startup: corrupt (kept aside
+// as config.corrupt.json) or unreadable (left untouched). This is state LOSS,
+// not a protection failure — the engine is fine — so it gets its own calm blue
+// presentation rather than being folded into the engine banner, which would
+// then be claiming the user is unprotected when they are not.
+function applyConfigNotice(notice: string | null | undefined) {
+  const banner = $("#config-notice-banner");
+  if (!notice) {
+    banner.classList.add("hidden");
+    return;
+  }
+  // The backend builds this across a multi-line format!(), so it arrives with a
+  // run of source indentation in the middle. Collapse it or the sentence renders
+  // with a visible gap.
+  const clean = notice.replace(/\s+/g, " ").trim();
+  // textContent: carries a filesystem path and an OS error string.
+  $("#config-notice-reason").textContent = clean;
+  banner.classList.remove("hidden");
+}
+
+// ---- Staleness heartbeat ----
+// The backend's monitor thread is the only source of status-update events. If it
+// dies (a panic, a poisoned config mutex) the UI would otherwise hold its last
+// snapshot forever — a frozen green light is indistinguishable from a working
+// one. Track when we last heard anything and say so once it goes quiet.
+let lastStatusMs = Date.now();
+let expectedIntervalSecs = 15;
+
+function markStatusFresh() {
+  lastStatusMs = Date.now();
+  $("#stale-banner").classList.add("hidden");
+}
+
+function checkStaleness() {
+  // Allow 3 missed ticks (and a 20s floor) before crying wolf.
+  const graceMs = Math.max(20_000, expectedIntervalSecs * 3 * 1000);
+  const ageMs = Date.now() - lastStatusMs;
+  const stale = ageMs > graceMs;
+  $("#stale-banner").classList.toggle("hidden", !stale);
+  if (stale) {
+    $("#stale-reason").textContent =
+      `No update from the protection monitor for ${Math.round(ageMs / 1000)}s. ` +
+      `What you see below may no longer be true.`;
+  }
 }
 
 interface AppTypeInfo {
@@ -144,6 +257,7 @@ let config: Config;
 let activityConfig: ActivityConfig | null = null;
 let syncConfig: SyncConfig | null = null;
 const statusById = new Map<string, TargetStatus>();
+const patchStateById = new Map<string, PatchState>();
 const iconMap = new Map<string, string>(); // lowercase process -> icon data URI
 let pendingIcon: string | null = null; // icon of the app being added via the picker
 
@@ -161,6 +275,7 @@ const STATUS_LABELS: Record<CaptureStatus, string> = {
   unprotected: "Capturable",
   partial: "Partly protected",
   "not-running": "Not running",
+  unknown: "Can't verify",
 };
 
 const BADGE_COLORS = [
@@ -185,6 +300,34 @@ function escapeHtml(s: string): string {
 }
 
 // ---- Rendering ----
+
+// A one-line explanation under a card whose state needs one. Without this,
+// "it used to say Protected and now it doesn't" has no visible cause — the
+// user sees the colour change but not the reason for it.
+function cardNote(t: Target, status: CaptureStatus): string {
+  if (!t.enabled) return "";
+  const patch = patchStateById.get(t.id) ?? "not-applicable";
+
+  // The patch is on disk but the running process predates it. Reporting either
+  // Protected or Capturable here would be wrong; only a relaunch activates it.
+  if (patch === "pending-restart") {
+    return `<div class="card-note attention">${escapeHtml(t.name)} was updated — protection has been re-applied. Fully quit and relaunch ${escapeHtml(t.name)} to activate it.</div>`;
+  }
+  // Patch missing entirely (e.g. wiped by an app update): a real exposure.
+  if (patch === "absent") {
+    return `<div class="card-note attention">The protection patch is missing from ${escapeHtml(t.name)} — an update may have removed it. Click Re-apply.</div>`;
+  }
+  // Partial almost always means an extra window (a dialog, file picker or
+  // popup) opened without protection. Say so, rather than just going amber.
+  if (status === "partial") {
+    return `<div class="card-note">Some windows aren't protected — usually an open dialog or file picker. Close it, or click Re-apply.</div>`;
+  }
+  if (status === "unknown") {
+    return `<div class="card-note attention">${escapeHtml(t.name)} is running but its windows can't be inspected — it may be minimized to the tray, or running at a level this app can't see.</div>`;
+  }
+  return "";
+}
+
 function renderCards() {
   const wrap = $("#cards");
   if (!config.targets.length) {
@@ -200,7 +343,7 @@ function renderCards() {
 
     const icon = iconMap.get(t.process.toLowerCase());
     const badge = icon
-      ? `<div class="badge badge-icon"><img src="${icon}" alt="" /></div>`
+      ? `<div class="badge badge-icon"><img src="${escapeHtml(icon)}" alt="" /></div>`
       : `<div class="badge" style="background:${badgeColor(t.id)}">${escapeHtml(
           (t.name[0] ?? "?").toUpperCase()
         )}</div>`;
@@ -220,13 +363,30 @@ function renderCards() {
           <label class="switch"><input type="checkbox" data-toggle="${t.id}" ${t.enabled ? "checked" : ""}/><span class="slider"></span></label>
         </div>
       </div>
+      ${cardNote(t, status)}
       <div class="card-foot">
         <span class="status ${status}"><span class="dot"></span>${STATUS_LABELS[status]}${
           showCounts ? ` · ${st!.windows_protected}/${st!.windows_total} window${st!.windows_total === 1 ? "" : "s"}` : ""
         }</span>
-        <button type="button" class="icon-toggle-btn${t.show_icon ? " on" : ""}" data-icon-toggle="${t.id}" title="${
-          t.show_icon ? "Defender icon shown on this app — click to hide" : "Show a defender status icon on this app"
-        }">🛡</button>
+        <span class="card-foot-actions">
+          ${
+            // Only offer a re-apply where it can actually do something: the app
+            // is running but isn't fully protected. refresh_now only re-READS
+            // status; this re-APPLIES it via the engine.
+            t.enabled &&
+            (status === "unprotected" ||
+              status === "partial" ||
+              status === "unknown" ||
+              // A missing on-disk patch is fixable by re-applying, even if the
+              // still-running process currently reads as protected.
+              patchStateById.get(t.id) === "absent")
+              ? `<button type="button" class="btn small reapply-btn" data-reapply="${t.id}">Re-apply</button>`
+              : ""
+          }
+          <button type="button" class="icon-toggle-btn${t.show_icon ? " on" : ""}" data-icon-toggle="${t.id}" title="${
+            t.show_icon ? "Defender icon shown on this app — click to hide" : "Show a defender status icon on this app"
+          }">🛡</button>
+        </span>
       </div>`;
     wrap.appendChild(card);
   }
@@ -240,22 +400,98 @@ function renderCards() {
   wrap.querySelectorAll<HTMLButtonElement>("[data-icon-toggle]").forEach((el) => {
     el.addEventListener("click", () => onToggleShowIcon(el.dataset.iconToggle as string));
   });
+  wrap.querySelectorAll<HTMLButtonElement>("[data-reapply]").forEach((el) => {
+    el.addEventListener("click", () => onReapply(el.dataset.reapply as string, el));
+  });
+}
+
+// Re-run the protection engine for one app. Wired to `protect_now`, which was
+// already implemented and registered in the backend but reachable from nowhere
+// in the UI — leaving the user with no way to recover a failed app short of
+// restarting the whole program.
+async function onReapply(id: string, btn: HTMLButtonElement) {
+  const prev = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Applying…";
+  try {
+    await invoke<string>("protect_now", { id });
+    const statuses = await invoke<TargetStatus[]>("refresh_now");
+    applyStatuses(statuses);
+    markStatusFresh();
+    renderCards();
+    renderMaster();
+  } catch (e) {
+    // Leave the card intact and say what failed, rather than silently
+    // reverting to a state that looks like nothing was attempted.
+    btn.disabled = false;
+    btn.textContent = prev;
+    alert(`Couldn't re-apply protection: ${e}`);
+  }
 }
 
 function renderMaster() {
   const on = config.master_enabled;
   ($("#master-toggle") as HTMLInputElement).checked = on;
+
+  // "Paused" (the user's choice) and "broken" (a failure) must never read the
+  // same. The engine banner carries the detail; the header says which it is.
+  if (engineHealth.state === "unavailable") {
+    $("#master-label").textContent = "Protection FAILED";
+    $("#master-sub").textContent = "The protection engine isn't running — see above";
+    return;
+  }
   $("#master-label").textContent = on ? "Protection ON" : "Protection paused";
-  const enabledCount = config.targets.filter((t) => t.enabled).length;
-  const protectedCount = config.targets.filter(
-    (t) => t.enabled && statusById.get(t.id)?.status === "protected"
+  if (!on) {
+    $("#master-sub").textContent = "All protection is paused";
+    return;
+  }
+
+  // Count only what's actually running. Folding not-running apps into the
+  // denominator made "2/3" ambiguous — the user couldn't tell whether the
+  // third app was closed or exposed, and "0/3" looked like total failure when
+  // every app was merely shut. Report exposure explicitly instead.
+  const enabled = config.targets.filter((t) => t.enabled);
+  const running = enabled.filter((t) => {
+    const s = statusById.get(t.id)?.status;
+    return s !== undefined && s !== "not-running";
+  });
+  const protectedCount = running.filter(
+    (t) => statusById.get(t.id)?.status === "protected"
   ).length;
-  $("#master-sub").textContent = on
-    ? `${protectedCount}/${enabledCount} active apps protected`
-    : "All protection is paused";
+  // "unknown" is its own case: we cannot see the app's windows, so calling it
+  // capturable would be as dishonest as calling it protected. Report the
+  // uncertainty as uncertainty.
+  const unverified = running.filter(
+    (t) => statusById.get(t.id)?.status === "unknown"
+  ).length;
+  const exposed = running.length - protectedCount - unverified;
+  const notRunning = enabled.length - running.length;
+
+  if (!enabled.length) {
+    $("#master-sub").textContent = "No apps are set to be protected";
+  } else if (!running.length) {
+    $("#master-sub").textContent = `No protected apps are running (${notRunning} waiting)`;
+  } else if (exposed > 0) {
+    const tail = unverified ? `, ${unverified} unverified` : "";
+    $("#master-sub").textContent =
+      `${exposed} of ${running.length} running app${running.length === 1 ? "" : "s"} still capturable${tail}`;
+  } else if (unverified > 0) {
+    $("#master-sub").textContent =
+      `${unverified} of ${running.length} running app${running.length === 1 ? "" : "s"} can't be verified`;
+  } else {
+    const tail = notRunning ? `, ${notRunning} not running` : "";
+    $("#master-sub").textContent =
+      running.length === 1
+        ? `The 1 running app is protected${tail}`
+        : `All ${running.length} running apps protected${tail}`;
+  }
 }
 
-function renderSettings(autostartEnabled: boolean, isElevated: boolean) {
+function renderSettings(
+  autostartEnabled: boolean,
+  isElevated: boolean,
+  elevatedTaskInstalled: boolean
+) {
   ($("#autostart-toggle") as HTMLInputElement).checked = autostartEnabled;
   ($("#startmin-toggle") as HTMLInputElement).checked = config.start_minimized;
   ($("#self-toggle") as HTMLInputElement).checked = config.protect_self;
@@ -268,8 +504,15 @@ function renderSettings(autostartEnabled: boolean, isElevated: boolean) {
 
   const status = $("#elev-status");
   const restartBtn = $("#elev-restart");
+  status.classList.remove("pill-danger");
   if (isElevated) {
     status.textContent = "elevated";
+  } else if (config.elevated_mode && !elevatedTaskInstalled) {
+    // Elevated mode is ON but the scheduled task never got registered, so the
+    // app will NOT come up elevated at logon however long the user waits.
+    // Saying "at next logon" here would be a promise the app can't keep.
+    status.textContent = "setup incomplete";
+    status.classList.add("pill-danger");
   } else if (config.elevated_mode) {
     status.textContent = "at next logon";
   } else {
@@ -360,7 +603,7 @@ function renderSafeKeys() {
   list.innerHTML = activityConfig.safe_keys
     .map(
       (k) =>
-        `<span class="key-chip">${k.label}<button type="button" data-remove="${encodeURIComponent(k.label)}" aria-label="Remove">&times;</button></span>`
+        `<span class="key-chip">${escapeHtml(k.label)}<button type="button" data-remove="${encodeURIComponent(k.label)}" aria-label="Remove">&times;</button></span>`
     )
     .join("");
   list.querySelectorAll("[data-remove]").forEach((btn) => {
@@ -477,7 +720,7 @@ function startRecording() {
 async function refreshSettings() {
   const state = await invoke<FullState>("get_state");
   config = state.config;
-  renderSettings(state.autostart_enabled, state.is_elevated);
+  renderSettings(state.autostart_enabled, state.is_elevated, state.elevated_task_installed);
 }
 
 function updateIntervalUi(v: number) {
@@ -493,7 +736,10 @@ function addLogRow(entry: LogEntry, prepend = true) {
   if (empty) empty.remove();
   const row = document.createElement("div");
   row.className = `log-row ${entry.level}`;
-  row.innerHTML = `<span class="log-time">${fmtTime(entry.ts_ms)}</span><span class="log-msg">${escapeHtml(entry.message)}</span>`;
+  // Stamped so renderLog() can tell which rows arrived live and preserve them.
+  row.dataset.ts = String(entry.ts_ms);
+  row.dataset.level = entry.level;
+  row.innerHTML = `<span class="log-time">${escapeHtml(fmtTime(entry.ts_ms))}</span><span class="log-msg">${escapeHtml(entry.message)}</span>`;
   if (prepend) log.prepend(row);
   else log.appendChild(row);
   while (log.children.length > 200) log.lastChild?.remove();
@@ -501,12 +747,30 @@ function addLogRow(entry: LogEntry, prepend = true) {
 
 function renderLog(entriesNewestFirst: LogEntry[]) {
   const log = $("#log");
+  // Live `log` events can land between listener registration and this first
+  // render. Wiping unconditionally would drop them — including the startup
+  // errors this panel exists to show — so carry across anything newer than
+  // the newest entry the backend just handed us.
+  const newestSnapshotTs = entriesNewestFirst[0]?.ts_ms ?? 0;
+  const carried: LogEntry[] = [];
+  log.querySelectorAll<HTMLElement>(".log-row").forEach((row) => {
+    const ts = Number(row.dataset.ts ?? "0");
+    if (ts > newestSnapshotTs) {
+      carried.push({
+        ts_ms: ts,
+        level: row.dataset.level ?? "info",
+        message: row.querySelector(".log-msg")?.textContent ?? "",
+      });
+    }
+  });
+
   log.innerHTML = "";
-  if (!entriesNewestFirst.length) {
+  const all = [...carried.sort((a, b) => b.ts_ms - a.ts_ms), ...entriesNewestFirst];
+  if (!all.length) {
     log.innerHTML = `<div class="log-empty">No activity yet.</div>`;
     return;
   }
-  for (const e of entriesNewestFirst) addLogRow(e, false);
+  for (const e of all) addLogRow(e, false);
   log.scrollTop = 0;
 }
 
@@ -541,7 +805,11 @@ async function checkForUpdates(manual: boolean) {
       title.textContent = "Up to date";
     }
   } catch (e) {
-    if (manual) title.textContent = "Couldn't check for updates";
+    // Previously an automatic check failed in total silence, so a user whose
+    // updates had been broken for months had no way to know.
+    title.textContent = manual
+      ? "Couldn't check for updates"
+      : "Update check failed — click to retry";
     console.error(e);
   } finally {
     btn.disabled = false;
@@ -575,8 +843,13 @@ async function downloadUpdateInBackground(update: Update) {
     $("#restart-update-btn").classList.remove("hidden");
     $("#check-update-btn").classList.add("hidden");
   } catch (e) {
-    title.textContent = "Update download failed";
+    // Keep the check button visible so the download can be retried without
+    // restarting the app.
+    title.textContent = "Update download failed — click Check again to retry";
     wrap.classList.add("hidden");
+    $("#check-update-btn").classList.remove("hidden");
+    $("#restart-update-btn").classList.add("hidden");
+    pendingUpdate = null;
     console.error(e);
   }
 }
@@ -758,7 +1031,7 @@ function renderScreenshotGrid(shots: ScreenshotInfo[]) {
   for (const shot of shots) {
     const tile = document.createElement("div");
     tile.className = "screenshot-tile";
-    tile.innerHTML = `<img src="${shot.data_uri}" alt="" loading="lazy" /><div class="shot-time">${fmtTime(shot.taken_at_ms)}</div>`;
+    tile.innerHTML = `<img src="${escapeHtml(shot.data_uri)}" alt="" loading="lazy" /><div class="shot-time">${escapeHtml(fmtTime(shot.taken_at_ms))}</div>`;
     tile.addEventListener("click", () => window.open(shot.data_uri, "_blank"));
     grid.appendChild(tile);
   }
@@ -829,11 +1102,21 @@ async function onRemoveTarget(id: string) {
 }
 
 async function onMasterToggle(on: boolean) {
-  const statuses = await invoke<TargetStatus[]>("set_master", { enabled: on });
-  config.master_enabled = on;
-  applyStatuses(statuses);
-  renderMaster();
-  renderCards();
+  try {
+    const statuses = await invoke<TargetStatus[]>("set_master", { enabled: on });
+    config.master_enabled = on;
+    applyStatuses(statuses);
+    markStatusFresh();
+    renderMaster();
+    renderCards();
+  } catch (e) {
+    // Never leave the master switch showing a state the backend didn't accept:
+    // a toggle stuck on "Protection ON" while protection is off is the worst
+    // possible lie this UI can tell.
+    ($("#master-toggle") as HTMLInputElement).checked = config.master_enabled;
+    renderMaster();
+    alert(`Couldn't ${on ? "resume" : "pause"} protection: ${e}`);
+  }
 }
 
 function applyStatuses(statuses: TargetStatus[]) {
@@ -841,8 +1124,10 @@ function applyStatuses(statuses: TargetStatus[]) {
 }
 
 async function loadTargetIcons() {
+  // config is unset if the core state load failed; don't throw a second,
+  // less useful error on top of the real one.
+  if (!config?.targets?.length) return;
   const procs = config.targets.map((t) => t.process);
-  if (!procs.length) return;
   try {
     const map = await invoke<Record<string, string>>("get_app_icons", { processes: procs });
     for (const [k, v] of Object.entries(map || {})) iconMap.set(k.toLowerCase(), v);
@@ -914,7 +1199,7 @@ function renderAppGrid(filter: string) {
     const tile = document.createElement("button");
     tile.className = "app-tile";
     const icon = a.icon
-      ? `<img src="${a.icon}" alt="" />`
+      ? `<img src="${escapeHtml(a.icon)}" alt="" />`
       : `<div class="tile-fallback" style="background:${badgeColor(a.process)}">${escapeHtml(
           (a.name[0] ?? "?").toUpperCase()
         )}</div>`;
@@ -1040,15 +1325,24 @@ function wireSyncEvents() {
     }
   });
   $("#sync-pause-toggle").addEventListener("change", async (e) => {
-    const status = await invoke<SyncStatus>("set_sync_paused", {
-      paused: (e.target as HTMLInputElement).checked,
-    });
-    renderSyncStatus(status);
+    const el = e.target as HTMLInputElement;
+    const on = el.checked;
+    try {
+      const status = await invoke<SyncStatus>("set_sync_paused", { paused: on });
+      renderSyncStatus(status);
+    } catch (err) {
+      alert(String(err));
+      el.checked = !on;
+    }
   });
   $("#sync-meeting-btn").addEventListener("click", async () => {
     const mins = Number(($("#sync-meeting-mins") as HTMLInputElement).value) || 30;
-    const status = await invoke<SyncStatus>("set_sync_meeting_mode", { minutes: mins });
-    renderSyncStatus(status);
+    try {
+      const status = await invoke<SyncStatus>("set_sync_meeting_mode", { minutes: mins });
+      renderSyncStatus(status);
+    } catch (err) {
+      alert(String(err));
+    }
   });
 
   const th = $("#sync-threshold-range") as HTMLInputElement;
@@ -1057,9 +1351,14 @@ function wireSyncEvents() {
     $("#sync-threshold-val").textContent = `${th.value} KB`;
   });
   th.addEventListener("change", async () => {
-    syncConfig = await invoke<SyncConfig>("set_sync_config", {
-      settings: { spike_threshold_kb: Number(th.value) },
-    });
+    try {
+      syncConfig = await invoke<SyncConfig>("set_sync_config", {
+        settings: { spike_threshold_kb: Number(th.value) },
+      });
+    } catch (err) {
+      alert(String(err));
+      if (syncConfig) renderSyncConfig(syncConfig);
+    }
   });
 
   const iv = $("#sync-interval-range") as HTMLInputElement;
@@ -1068,9 +1367,14 @@ function wireSyncEvents() {
     $("#sync-interval-val").textContent = `${iv.value}s`;
   });
   iv.addEventListener("change", async () => {
-    syncConfig = await invoke<SyncConfig>("set_sync_config", {
-      settings: { poll_interval_secs: Number(iv.value) },
-    });
+    try {
+      syncConfig = await invoke<SyncConfig>("set_sync_config", {
+        settings: { poll_interval_secs: Number(iv.value) },
+      });
+    } catch (err) {
+      alert(String(err));
+      if (syncConfig) renderSyncConfig(syncConfig);
+    }
   });
 
   const cd = $("#sync-cooldown-range") as HTMLInputElement;
@@ -1079,20 +1383,35 @@ function wireSyncEvents() {
     $("#sync-cooldown-val").textContent = `${cd.value}s`;
   });
   cd.addEventListener("change", async () => {
-    syncConfig = await invoke<SyncConfig>("set_sync_config", {
-      settings: { cooldown_secs: Number(cd.value) },
-    });
+    try {
+      syncConfig = await invoke<SyncConfig>("set_sync_config", {
+        settings: { cooldown_secs: Number(cd.value) },
+      });
+    } catch (err) {
+      alert(String(err));
+      if (syncConfig) renderSyncConfig(syncConfig);
+    }
   });
 
   $("#sync-quiet-from").addEventListener("change", async (e) => {
-    syncConfig = await invoke<SyncConfig>("set_sync_config", {
-      settings: { quiet_from: (e.target as HTMLInputElement).value },
-    });
+    try {
+      syncConfig = await invoke<SyncConfig>("set_sync_config", {
+        settings: { quiet_from: (e.target as HTMLInputElement).value },
+      });
+    } catch (err) {
+      alert(String(err));
+      if (syncConfig) renderSyncConfig(syncConfig);
+    }
   });
   $("#sync-quiet-to").addEventListener("change", async (e) => {
-    syncConfig = await invoke<SyncConfig>("set_sync_config", {
-      settings: { quiet_to: (e.target as HTMLInputElement).value },
-    });
+    try {
+      syncConfig = await invoke<SyncConfig>("set_sync_config", {
+        settings: { quiet_to: (e.target as HTMLInputElement).value },
+      });
+    } catch (err) {
+      alert(String(err));
+      if (syncConfig) renderSyncConfig(syncConfig);
+    }
   });
 
   $("#tracker-add-btn").addEventListener("click", async () => {
@@ -1115,8 +1434,12 @@ function wireSyncEvents() {
   });
   $("#sync-clear-events").addEventListener("click", async () => {
     if (!confirm("Wipe the entire Sync Monitor event history from disk? This can't be undone.")) return;
-    await invoke("wipe_sync_events");
-    $("#sync-events").innerHTML = `<div class="log-empty">No events yet.</div>`;
+    try {
+      await invoke("wipe_sync_events");
+      $("#sync-events").innerHTML = `<div class="log-empty">No events yet.</div>`;
+    } catch (err) {
+      alert(String(err));
+    }
   });
 }
 
@@ -1126,11 +1449,67 @@ function wireEvents() {
   $("#master-toggle").addEventListener("change", (e) =>
     onMasterToggle((e.target as HTMLInputElement).checked)
   );
-  $("#refresh-btn").addEventListener("click", async () => {
+  const doRefresh = async () => {
     const statuses = await invoke<TargetStatus[]>("refresh_now");
     applyStatuses(statuses);
+    markStatusFresh();
     renderCards();
     renderMaster();
+  };
+  $("#refresh-btn").addEventListener("click", () => {
+    doRefresh().catch((e) => alert(`Couldn't re-check protection: ${e}`));
+  });
+  $("#stale-refresh-btn").addEventListener("click", () => {
+    doRefresh().catch((e) => alert(`Couldn't re-check protection: ${e}`));
+  });
+
+  // Dismissable: it reports something that already happened and cannot be
+  // undone from here, so it should not sit there forever once read.
+  $("#config-notice-dismiss").addEventListener("click", () => {
+    $("#config-notice-banner").classList.add("hidden");
+  });
+
+  // Retry the whole core load after a boot failure, in place — no restart.
+  $("#boot-retry-btn").addEventListener("click", async () => {
+    const btn = $("#boot-retry-btn") as HTMLButtonElement;
+    btn.disabled = true;
+    btn.textContent = "Retrying…";
+    // Clear the latch so a fresh failure reports its own reason, not the old one.
+    $("#boot-error-banner").classList.add("hidden");
+    try {
+      await loadCoreState();
+      loadSecondaryPanels();
+    } catch (e) {
+      showBootError(e);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "Retry";
+    }
+  });
+
+  // Re-apply protection for every enabled app that isn't fully protected.
+  $("#engine-reapply-btn").addEventListener("click", async () => {
+    const btn = $("#engine-reapply-btn") as HTMLButtonElement;
+    btn.disabled = true;
+    btn.textContent = "Applying…";
+    const failures: string[] = [];
+    for (const t of config.targets.filter((x) => x.enabled)) {
+      const s = statusById.get(t.id)?.status;
+      if (s === "not-running") continue;
+      try {
+        await invoke<string>("protect_now", { id: t.id });
+      } catch (e) {
+        failures.push(`${t.name}: ${e}`);
+      }
+    }
+    try {
+      await doRefresh();
+    } catch (e) {
+      console.error(e);
+    }
+    btn.disabled = false;
+    btn.textContent = "Re-apply protection";
+    if (failures.length) alert(`Some apps couldn't be re-protected:\n\n${failures.join("\n")}`);
   });
   $("#add-btn").addEventListener("click", openModal);
   $("#app-search").addEventListener("input", (e) =>
@@ -1169,8 +1548,14 @@ function wireEvents() {
     }
   });
   $("#startmin-toggle").addEventListener("change", async (e) => {
-    const on = (e.target as HTMLInputElement).checked;
-    config = await invoke<Config>("update_settings", { settings: { start_minimized: on } });
+    const el = e.target as HTMLInputElement;
+    const on = el.checked;
+    try {
+      config = await invoke<Config>("update_settings", { settings: { start_minimized: on } });
+    } catch (err) {
+      alert(String(err));
+      el.checked = !on;
+    }
   });
   $("#self-toggle").addEventListener("change", async (e) => {
     const el = e.target as HTMLInputElement;
@@ -1245,9 +1630,17 @@ function wireEvents() {
   const range = $("#interval-range") as HTMLInputElement;
   range.addEventListener("input", () => updateIntervalUi(Number(range.value)));
   range.addEventListener("change", async () => {
-    config = await invoke<Config>("update_settings", {
-      settings: { interval_secs: Number(range.value) },
-    });
+    try {
+      config = await invoke<Config>("update_settings", {
+        settings: { interval_secs: Number(range.value) },
+      });
+      // Keep the staleness grace window in step with the poll interval.
+      expectedIntervalSecs = config.interval_secs || expectedIntervalSecs;
+    } catch (err) {
+      alert(String(err));
+      range.value = String(config.interval_secs);
+      updateIntervalUi(config.interval_secs);
+    }
   });
   $("#open-folder").addEventListener("click", () => invoke("open_config_folder"));
   $("#check-update-btn").addEventListener("click", () => checkForUpdates(true));
@@ -1267,12 +1660,24 @@ function wireEvents() {
 async function listenEvents() {
   await listen<TargetStatus[]>("status-update", (e) => {
     applyStatuses(e.payload);
+    markStatusFresh();
     renderCards();
     renderMaster();
   });
+  await listen<PatchStateEntry[]>("patch-state-update", (e) => {
+    for (const p of e.payload) patchStateById.set(p.id, p.patch_state);
+    renderCards();
+  });
   await listen<LogEntry>("log", (e) => addLogRow(e.payload, true));
-  await listen<{ fullscreen_active: boolean }>("system-status", (e) =>
-    setFullscreenBanner(e.payload.fullscreen_active)
+  await listen<{ fullscreen_active: boolean; engine_health?: EngineHealth }>(
+    "system-status",
+    (e) => {
+      setFullscreenBanner(e.payload.fullscreen_active);
+      // Only react if the backend actually sends health; an older backend
+      // omits it and must not be read as a state change.
+      if (e.payload.engine_health) applyEngineHealth(e.payload.engine_health);
+      markStatusFresh();
+    }
   );
   await listen<WaBlurStatus>("wablur-status", (e) => applyWablurStatus(e.payload));
   await listen<ActivityStatus>("activity-status", (e) => applyActivityStatus(e.payload));
@@ -1281,27 +1686,109 @@ async function listenEvents() {
 }
 
 // ---- Boot ----
-async function boot() {
-  wireEvents();
-  await listenEvents();
+
+// Show the hard-failure banner. Used when the core state load fails, which
+// leaves every panel below either empty or lying, so we say so at the top
+// rather than presenting a half-drawn window as if it were fine.
+function showBootError(e: unknown) {
+  const banner = $("#boot-error-banner");
+  // Keep the FIRST error. Later knock-on failures (a panel tripping over the
+  // state that never loaded) are symptoms, and would otherwise bury the
+  // backend message that actually explains what went wrong.
+  if (banner.classList.contains("hidden")) {
+    // textContent: the error may carry OS/backend text we don't control.
+    $("#boot-error-reason").textContent = String(e);
+  }
+  banner.classList.remove("hidden");
+  const sub = $("#master-sub");
+  if (sub.textContent === "Loading…") sub.textContent = "Couldn't read protection state";
+}
+
+// Load everything that the main view needs. Split out of boot() so the Retry
+// button can re-run exactly the same sequence without reloading the window.
+async function loadCoreState() {
   const state = await invoke<FullState>("get_state");
   config = state.config;
   applyStatuses(state.statuses);
+  markStatusFresh();
+  expectedIntervalSecs = state.config.interval_secs || expectedIntervalSecs;
+  applyEngineHealth(state.engine_health);
+  applyConfigNotice(state.config_notice);
   renderLog([...state.log].reverse()); // newest first
   renderCards();
   renderMaster();
-  renderSettings(state.autostart_enabled, state.is_elevated);
+  renderSettings(state.autostart_enabled, state.is_elevated, state.elevated_task_installed);
   setFullscreenBanner(state.fullscreen_active);
-  loadTargetIcons(); // fill in real app icons (non-blocking)
-  invoke<WaBlurStatus>("get_wablur_status").then(applyWablurStatus);
-  invoke<ActivityStatus>("get_activity_status").then(applyActivityStatus);
-  invoke<SyncConfig>("get_sync_config").then((c) => {
-    syncConfig = c;
-    renderSyncConfig(c);
-  });
-  invoke<SyncStatus>("get_sync_status").then(renderSyncStatus);
-  invoke<SyncEvent[]>("get_sync_events", { limit: 200 }).then(renderSyncEvents);
-  initUpdater();
+  $("#boot-error-banner").classList.add("hidden");
 }
+
+// Secondary panels. Each is independent and must not be able to take down the
+// main view (or each other) — previously these were bare .then() chains, so a
+// single rejection became an unhandled rejection and left its panel showing
+// placeholder text with no explanation.
+function loadSecondaryPanels() {
+  loadTargetIcons(); // fill in real app icons (non-blocking, self-catching)
+  const soft = (label: string, p: Promise<unknown>) =>
+    p.catch((e) => console.error(`${label} failed to load:`, e));
+
+  soft("WhatsApp privacy status", invoke<WaBlurStatus>("get_wablur_status").then(applyWablurStatus));
+  soft("Activity status", invoke<ActivityStatus>("get_activity_status").then(applyActivityStatus));
+  soft(
+    "Sync config",
+    invoke<SyncConfig>("get_sync_config").then((c) => {
+      syncConfig = c;
+      renderSyncConfig(c);
+    })
+  );
+  soft("Sync status", invoke<SyncStatus>("get_sync_status").then(renderSyncStatus));
+  soft(
+    "Sync events",
+    invoke<SyncEvent[]>("get_sync_events", { limit: 200 }).then(renderSyncEvents)
+  );
+}
+
+async function boot() {
+  // A failure anywhere below used to abort the rest of boot() silently, leaving
+  // the window on its static skeleton ("Loading…") with no error and no way
+  // back short of restarting the app. Everything is now guarded.
+  try {
+    wireEvents();
+  } catch (e) {
+    console.error("Failed to wire UI events:", e);
+    showBootError(e);
+    return; // Nothing below can work without handlers; the banner is all we have.
+  }
+
+  try {
+    await listenEvents();
+  } catch (e) {
+    // Live updates are dead, but a static render is still worth showing.
+    console.error("Failed to subscribe to backend events:", e);
+  }
+
+  try {
+    await loadCoreState();
+  } catch (e) {
+    console.error("Failed to load state:", e);
+    showBootError(e);
+  }
+
+  loadSecondaryPanels();
+
+  try {
+    initUpdater();
+  } catch (e) {
+    console.error("Updater init failed:", e);
+  }
+
+  setInterval(checkStaleness, 5000);
+}
+
+// Last-resort visibility. Without this, a rejected invoke anywhere in the app
+// vanishes into the console of a webview nobody has open.
+window.addEventListener("unhandledrejection", (e) => {
+  console.error("Unhandled rejection:", e.reason);
+  if (!config) showBootError(e.reason);
+});
 
 window.addEventListener("DOMContentLoaded", boot);

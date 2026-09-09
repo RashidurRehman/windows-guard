@@ -13,12 +13,15 @@
 
 use serde::Serialize;
 use std::collections::HashMap;
-use tauri::{AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 use crate::AppState;
 
 const BADGE_SIZE: f64 = 28.0;
 const POLL_MS: u64 = 1000;
+/// Cadence when no target wants a badge — just often enough to notice the user
+/// switching one on.
+const IDLE_POLL_MS: u64 = 3000;
 
 #[derive(Serialize, Clone)]
 struct BadgeStatus {
@@ -46,6 +49,11 @@ fn ensure_window(app: &AppHandle, id: &str) -> Option<WebviewWindow> {
         .visible(false)
         .resizable(false)
         .focused(false)
+        // The badge is a live readout of WHICH apps are protected and their
+        // exact status — precisely what the user is hiding. Leaving it out of
+        // the capture exclusion would leak that into the very screenshots this
+        // app exists to defend against, so it protects itself unconditionally.
+        .content_protected(true)
         .build()
         .ok()
 }
@@ -56,16 +64,28 @@ fn status_str(s: crate::winapi::CaptureStatus) -> &'static str {
         crate::winapi::CaptureStatus::Partial => "partial",
         crate::winapi::CaptureStatus::Unprotected => "unprotected",
         crate::winapi::CaptureStatus::NotRunning => "not-running",
+        // Running but no countable window: either harmlessly tray-minimized or
+        // we genuinely cannot see its windows (UIPI/session/renamed exe), which
+        // means the user may be exposed. Never render that as protected.
+        crate::winapi::CaptureStatus::NoWindows => "unknown",
     }
 }
 
 /// One supervisor tick: show/reposition/hide a badge per target with
 /// `show_icon` on, and close badges for targets that no longer want one.
-fn tick(app: &AppHandle, live: &mut HashMap<String, ()>) {
+/// Returns true if at least one badge is currently wanted, so the supervisor
+/// can idle cheaply when the feature is off (the common case).
+fn tick(app: &AppHandle, live: &mut HashMap<String, ()>) -> bool {
     let targets = {
         let st = app.state::<AppState>();
-        let targets = st.config.lock().unwrap().targets.clone();
-        targets
+        // Recover a poisoned lock rather than unwrapping. This is the badge
+        // supervisor's only read of the config, and it runs forever: if some
+        // other holder panicked while holding the mutex, unwrapping here would
+        // kill this thread for the rest of the session and freeze every badge
+        // on its last drawn status — a stale "protected" dot is indistinguishable
+        // from a live one.
+        let guard = st.config.lock().unwrap_or_else(|e| e.into_inner());
+        guard.targets.clone()
     };
 
     let mut wanted: HashMap<String, ()> = HashMap::new();
@@ -73,9 +93,13 @@ fn tick(app: &AppHandle, live: &mut HashMap<String, ()>) {
         wanted.insert(t.id.clone(), ());
         let wins = crate::winapi::matched_windows(&t.process, &t.class, &t.title, t.all_windows);
         let Some(target_win) = wins.first() else {
+            // Target isn't running: close the badge rather than just hiding it.
+            // Hidden windows were never reclaimed, so an app the user opens and
+            // closes repeatedly left a webview behind every time.
             if let Some(w) = app.get_webview_window(&label_for(&t.id)) {
-                let _ = w.hide();
+                let _ = w.close();
             }
+            live.remove(&t.id);
             continue;
         };
         let Some((_, top, right, _)) = crate::winapi::window_rect(target_win.hwnd) else {
@@ -83,7 +107,15 @@ fn tick(app: &AppHandle, live: &mut HashMap<String, ()>) {
         };
         let Some(w) = ensure_window(app, &t.id) else { continue };
         let _ = w.set_size(LogicalSize::new(BADGE_SIZE, BADGE_SIZE));
-        let _ = w.set_position(LogicalPosition::new((right - BADGE_SIZE as i32 - 10) as f64, (top + 10) as f64));
+        // `GetWindowRect` reports PHYSICAL pixels, so the offsets derived from it
+        // must be physical too. Feeding them to `LogicalPosition` made Tauri scale
+        // them a second time, putting the badge progressively further from its
+        // window the further right it sat and the higher the display scaling —
+        // visible on any scaled or multi-monitor desktop.
+        let scale = w.scale_factor().unwrap_or(1.0);
+        let inset = ((BADGE_SIZE + 10.0) * scale).round() as i32;
+        let margin = (10.0 * scale).round() as i32;
+        let _ = w.set_position(PhysicalPosition::new(right - inset, top + margin));
         let _ = w.show();
 
         let probe = crate::winapi::probe(&t.process, &t.class, &t.title, t.all_windows);
@@ -107,14 +139,20 @@ fn tick(app: &AppHandle, live: &mut HashMap<String, ()>) {
     for id in wanted.keys() {
         live.insert(id.clone(), ());
     }
+    !wanted.is_empty()
 }
 
 pub fn spawn(app: AppHandle) {
     std::thread::spawn(move || {
         let mut live: HashMap<String, ()> = HashMap::new();
         loop {
-            tick(&app, &mut live);
-            std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
+            let active = tick(&app, &mut live);
+            // Each tick enumerates windows and probes every badged target. With
+            // no badges enabled — the default, and every target's current state —
+            // that work is pure waste at 1Hz, so back off hard until the user
+            // turns one on. Responsiveness only matters while a badge is visible.
+            let wait = if active { POLL_MS } else { IDLE_POLL_MS };
+            std::thread::sleep(std::time::Duration::from_millis(wait));
         }
     });
 }

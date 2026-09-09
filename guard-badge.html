@@ -52,16 +52,27 @@
       import { listen } from "@tauri-apps/api/event";
 
       const dot = document.getElementById("dot");
+      // Amber = "needs attention / we can't confirm". Grey is reserved for the
+      // one genuinely calm state: the app isn't running.
+      const ATTENTION = "#f5b544";
       const COLORS = {
         protected: "#3ddc97",
-        partial: "#f5b544",
+        partial: ATTENTION,
         unprotected: "#ff6b6b",
         "not-running": "#6b7787",
+        // Process is running but no window is countable: either harmlessly
+        // tray-minimized, or we cannot see its windows at all (UIPI/session
+        // mismatch, renamed exe) — which means the user may be exposed.
+        unknown: ATTENTION,
       };
 
       listen("badge-status", (e) => {
-        const status = e.payload?.status || "not-running";
-        dot.style.background = COLORS[status] || COLORS["not-running"];
+        const status = e.payload?.status || "unknown";
+        // Fail LOUD: any status this build doesn't recognise (e.g. a newer
+        // backend variant) shows as attention, never as the calm grey. A dot
+        // that quietly reads "fine" for an unknown state is the exact failure
+        // this app exists to prevent.
+        dot.style.background = COLORS[status] ?? ATTENTION;
         document.getElementById("badge").title = e.payload?.label || "Windows Guard";
       });
 

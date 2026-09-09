@@ -54,6 +54,39 @@
         </nav>
 
         <div class="main-col">
+          <div id="boot-error-banner" class="banner banner-error hidden">
+            <span class="banner-msg">
+              <b>Windows Guard couldn't start up properly.</b>
+              <span id="boot-error-reason"></span>
+              Protection state is unknown — nothing on this screen can be trusted until this is resolved.
+            </span>
+            <button id="boot-retry-btn" class="btn small banner-btn" type="button">Retry</button>
+          </div>
+
+          <div id="config-notice-banner" class="banner banner-info hidden">
+            <span class="banner-msg">
+              <b>Your settings couldn't be loaded.</b>
+              <span id="config-notice-reason"></span>
+            </span>
+            <button id="config-notice-dismiss" class="btn small banner-btn" type="button">Dismiss</button>
+          </div>
+
+          <div id="engine-banner" class="banner banner-error hidden">
+            <span class="banner-msg">
+              <b id="engine-banner-title">Protection engine unavailable.</b>
+              <span id="engine-banner-reason"></span>
+            </span>
+            <button id="engine-reapply-btn" class="btn small banner-btn" type="button">Re-apply protection</button>
+          </div>
+
+          <div id="stale-banner" class="banner hidden">
+            <span class="banner-msg">
+              ⚠ <b>Status may be out of date.</b>
+              <span id="stale-reason"></span>
+            </span>
+            <button id="stale-refresh-btn" class="btn small banner-btn" type="button">Re-check now</button>
+          </div>
+
           <div id="fullscreen-banner" class="banner hidden">
             ⚠ A full-screen app is running — capture protection can't apply to exclusive full-screen. Run games in <b>borderless / windowed</b> mode.
           </div>

@@ -318,8 +318,19 @@ impl Config {
         dir.join("config.json")
     }
 
+    /// Where a config we failed to parse gets moved to, so it is never silently
+    /// destroyed by the default that replaces it.
+    pub fn corrupt_backup_path(dir: &Path) -> PathBuf {
+        dir.join("config.corrupt.json")
+    }
+
     /// Load config from the app config dir, or create a default one on first run.
-    pub fn load_or_default(dir: &Path) -> Config {
+    ///
+    /// Returns the config plus an optional human-readable warning describing why
+    /// the saved settings could not be used. A parse failure means every
+    /// protected app silently disappears, so the caller is expected to surface
+    /// that warning rather than let the user discover it by being unprotected.
+    pub fn load_reporting(dir: &Path) -> (Config, Option<String>) {
         let path = Self::config_path(dir);
         match fs::read_to_string(&path) {
             Ok(text) => match serde_json::from_str::<Config>(&text) {
@@ -327,22 +338,84 @@ impl Config {
                     // Make sure new builtin defaults appear for existing users
                     // without clobbering their toggles.
                     cfg.merge_missing_builtins();
-                    cfg
+                    (cfg, None)
                 }
-                Err(_) => Config::default(),
+                Err(e) => {
+                    // Keep the unreadable file instead of overwriting it: it is
+                    // the only record of the user's setup and is very often
+                    // recoverable by hand.
+                    let backup = Self::corrupt_backup_path(dir);
+                    let saved = fs::rename(&path, &backup).is_ok();
+                    let warning = if saved {
+                        format!(
+                            "Saved settings could not be read ({e}) — starting with defaults. Your previous file was kept at {}.",
+                            backup.display()
+                        )
+                    } else {
+                        format!(
+                            "Saved settings could not be read ({e}) — starting with defaults. The existing file at {} was left untouched.",
+                            path.display()
+                        )
+                    };
+                    (Config::default(), Some(warning))
+                }
             },
-            Err(_) => {
+            // No file yet (first run) is the normal path, not an error.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let cfg = Config::default();
                 let _ = cfg.save(dir);
-                cfg
+                (cfg, None)
             }
+            // Present but unreadable (permissions, a lock, IO failure). Do NOT
+            // write defaults over it — the file may be perfectly good and simply
+            // unavailable this moment.
+            Err(e) => (
+                Config::default(),
+                Some(format!(
+                    "Could not open {} ({e}) — running with defaults; your saved settings were not changed.",
+                    path.display()
+                )),
+            ),
         }
     }
 
+    /// Load config from the app config dir, or create a default one on first run.
+    pub fn load_or_default(dir: &Path) -> Config {
+        Self::load_reporting(dir).0
+    }
+
+    /// Write the config out atomically: serialize to a temp file in the same
+    /// directory, then rename it over the real one. A rename within a directory
+    /// is atomic, so a crash or a kill (this app gets ended from Task Manager
+    /// routinely) can leave the old config or the new one, but never a truncated
+    /// file — which previously meant losing every protected app on next start.
+    ///
+    /// The serialized bytes are unchanged from before: same `to_string_pretty`,
+    /// same fields, same order. Only the write path differs, so a config written
+    /// here is still readable by an older build.
     pub fn save(&self, dir: &Path) -> std::io::Result<()> {
         fs::create_dir_all(dir)?;
-        let text = serde_json::to_string_pretty(self).unwrap_or_default();
-        fs::write(Self::config_path(dir), text)
+        let text = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
+
+        let final_path = Self::config_path(dir);
+        let tmp_path = dir.join("config.json.tmp");
+
+        // Write and flush the full contents before any rename, so the temp file
+        // is complete on disk by the time it replaces the real one.
+        {
+            use std::io::Write as _;
+            let mut f = fs::File::create(&tmp_path)?;
+            f.write_all(text.as_bytes())?;
+            f.sync_all()?;
+        }
+
+        match fs::rename(&tmp_path, &final_path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = fs::remove_file(&tmp_path);
+                Err(e)
+            }
+        }
     }
 
     fn merge_missing_builtins(&mut self) {

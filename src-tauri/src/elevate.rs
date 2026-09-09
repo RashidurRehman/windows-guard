@@ -81,10 +81,147 @@ pub fn run_task_now() -> Result<(), String> {
     cmd.creation_flags(CREATE_NO_WINDOW);
     let out = cmd.output().map_err(|e| e.to_string())?;
     if out.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        return Ok(());
     }
+    // ERROR_TASK_ALREADY_RUNNING (0x800710E0). At logon the task's own
+    // LogonTrigger is firing at the same moment we ask for an on-demand run,
+    // so `schtasks /Run` loses the race and reports the task as already
+    // started. That is a SUCCESSFUL hand-off, not a failure: an elevated
+    // instance is already coming up and `MultipleInstancesPolicy=IgnoreNew`
+    // is doing exactly what it should. Treating it as an error is what used
+    // to leave the unelevated caller alive alongside the elevated copy.
+    if is_already_running() {
+        return Ok(());
+    }
+    let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    Err(if msg.is_empty() {
+        format!("schtasks /Run failed (exit {:?})", out.status.code())
+    } else {
+        msg
+    })
+}
+
+/// Does this `schtasks /Run` failure actually mean "an instance is already
+/// starting"?
+///
+/// Deliberately does NOT try to read the answer out of `schtasks`: measured on
+/// Windows 11, `schtasks /Run` against a task it cannot start exits with a plain
+/// `1` and prints localized prose containing no error code at all, so neither
+/// the exit code nor the message text can be matched reliably. (The 0x800710E0
+/// ERROR_TASK_ALREADY_RUNNING that identifies this case shows up on the task's
+/// stored Last Result, not on the `/Run` invocation.) So we ask the Schedule
+/// Service for the task's state instead.
+///
+/// Anything we cannot positively confirm is treated as NOT already running, so
+/// an ambiguous failure falls through to the caller's verification step rather
+/// than being optimistically reported as a successful hand-off.
+fn is_already_running() -> bool {
+    task_state_is_running().unwrap_or(false)
+}
+
+/// Ask the Schedule Service whether our task is in the Running state.
+/// `Some(false)` = definitely not running, `None` = couldn't tell.
+///
+/// Uses PowerShell's `Get-ScheduledTask` because its `State` is a typed enum
+/// whose names are invariant, unlike `schtasks /Query`, whose "Status: Running"
+/// line is localized and would silently stop matching on a non-English Windows.
+fn task_state_is_running() -> Option<bool> {
+    let script = format!(
+        "(Get-ScheduledTask -TaskName '{}' -ErrorAction Stop).State",
+        TASK_NAME.replace('\'', "''")
+    );
+    let mut cmd = Command::new("powershell.exe");
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .eq_ignore_ascii_case("Running"),
+    )
+}
+
+/// Wait (briefly) for an elevated instance of `exe` other than ourselves to
+/// exist. `schtasks /Run` returns as soon as the request is QUEUED, not when
+/// the process has started, so a caller that exits on its return alone can
+/// leave zero instances running. Polls until `timeout`, returning true as soon
+/// as another instance of our own image is observed.
+pub fn wait_for_other_instance(exe: &Path, timeout: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if other_instance_running(exe) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    other_instance_running(exe)
+}
+
+/// Is another process running the same image as `exe` (ignoring ourselves)?
+#[cfg(windows)]
+fn other_instance_running(exe: &Path) -> bool {
+    let Some(name) = exe.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let me = std::process::id();
+    // `tasklist` is used rather than a toolhelp snapshot because an unelevated
+    // caller can enumerate image names of elevated processes this way without
+    // needing to OPEN them (OpenProcess against an elevated PID from a normal
+    // token fails with access-denied, which is the very situation we're in).
+    let mut cmd = Command::new("tasklist.exe");
+    cmd.args(["/FI", &format!("IMAGENAME eq {name}"), "/NH", "/FO", "CSV"]);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let Ok(out) = cmd.output() else {
+        return false;
+    };
+    String::from_utf8_lossy(&out.stdout).lines().any(|line| {
+        // CSV: "image","pid","session","session#","mem"
+        let mut fields = line.split("\",\"");
+        let matches_image = fields
+            .next()
+            .map(|f| f.trim_start_matches('"').eq_ignore_ascii_case(name))
+            .unwrap_or(false);
+        let pid: Option<u32> = fields.next().and_then(|f| f.trim().parse().ok());
+        matches_image && pid.map(|p| p != me).unwrap_or(false)
+    })
+}
+
+#[cfg(not(windows))]
+fn other_instance_running(_exe: &Path) -> bool {
+    false
+}
+
+/// Name of the `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` value that
+/// `tauri-plugin-autostart` writes. Must match the app's product name.
+const RUN_KEY_VALUE: &str = "Windows Guard";
+
+/// Delete our `HKCU\...\Run` autostart value, if present.
+///
+/// When elevated mode is on the scheduled task is the ONLY thing allowed to
+/// start us at logon. The Run key launches an UNELEVATED copy (that hive always
+/// uses the plain user token) at the same moment, and an unelevated instance
+/// cannot install its hooks — so leaving both registered is what made every
+/// target silently capturable after a reboot.
+///
+/// Uses `reg.exe` rather than the autostart plugin because this has to run
+/// before the Tauri app (and its AppHandle) exists. Deleting a value under HKCU
+/// needs no elevation. A missing value is not an error.
+pub fn remove_run_key() {
+    let mut cmd = Command::new("reg.exe");
+    cmd.args([
+        "delete",
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+        "/V",
+        RUN_KEY_VALUE,
+        "/F",
+    ]);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let _ = cmd.output();
 }
 
 /// Relaunch the app elevated now. Tries the silent, no-prompt task trigger
@@ -169,6 +306,16 @@ fn current_user() -> String {
     }
 }
 
+/// This task is the SOLE logon-start mechanism whenever elevated mode is on —
+/// the HKCU\Run autostart key is deliberately removed in that case (see
+/// `setup()` in lib.rs). Two independent logon launches of the same exe used to
+/// race: the Run key's unelevated copy would call `run_task_now()` at the exact
+/// moment the LogonTrigger fired, collide with `MultipleInstancesPolicy`
+/// =IgnoreNew, read the resulting ERROR_TASK_ALREADY_RUNNING as a failed
+/// hand-off, and therefore NOT exit — leaving an unelevated instance running
+/// that can never install its hooks (no SeDebugPrivilege) while the UI happily
+/// reported everything as protected.
+///
 /// No `--minimized` argument here deliberately: this same task also fires for
 /// the non-elevated->elevated hand-off on every manual launch (see `setup()`
 /// in lib.rs), not just the logon trigger. Hardcoding `--minimized` used to

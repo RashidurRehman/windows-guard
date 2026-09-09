@@ -191,6 +191,55 @@ body {
 }
 .banner b { color: var(--amber); font-weight: 650; }
 
+/* Banners that carry an action sit as a row; the message takes the slack. */
+.banner:not(.hidden) {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  text-align: left;
+}
+.banner .banner-msg { flex: 1; }
+.banner .banner-btn { flex-shrink: 0; }
+
+/* A FAILURE is red, never amber. Amber banners are advisory ("a full-screen
+   app is running", "status may be stale"); red means protection is not
+   working. This must not be confusable with the paused/off state, which is
+   the master toggle's own styling — see renderMaster(). */
+.banner-error {
+  background: rgba(255, 107, 107, 0.12);
+  border-bottom: 1px solid rgba(255, 107, 107, 0.4);
+  color: var(--red);
+}
+.banner-error b { color: var(--red); }
+
+/* Degraded: the engine loaded but isn't covering everything. Amber, because
+   it is a partial failure, but it still carries an action. */
+.banner-degraded {
+  background: rgba(245, 181, 68, 0.12);
+  border-bottom: 1px solid rgba(245, 181, 68, 0.35);
+  color: var(--amber);
+}
+.banner-degraded b { color: var(--amber); }
+
+/* State loss, NOT a protection failure. Blue keeps it clearly apart from red
+   ("you are exposed") and amber ("attention needed") — the engine is fine here,
+   the user has just lost their saved settings. Saying otherwise would make the
+   banner lie, which is the whole class of bug this UI work removed. */
+.banner-info {
+  background: rgba(91, 157, 255, 0.12);
+  border-bottom: 1px solid rgba(91, 157, 255, 0.35);
+  color: var(--blue);
+}
+.banner-info b { color: var(--blue); }
+
+.banner-btn {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  color: inherit;
+}
+.banner-btn:hover:not(:disabled) { background: rgba(255, 255, 255, 0.14); }
+
 /* ---------- Layout ---------- */
 .content {
   flex: 1;
@@ -359,6 +408,41 @@ body {
   justify-content: space-between;
 }
 
+/* Explains WHY a card is amber. Muted by default; "attention" for states the
+   user has to act on. Never green — a note only appears when something is off. */
+.card-note {
+  margin-top: 10px;
+  padding: 7px 9px;
+  border-radius: 8px;
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--text-dim);
+  background: rgba(255, 255, 255, 0.035);
+  border-left: 2px solid var(--line);
+}
+.card-note.attention {
+  color: var(--amber);
+  background: rgba(245, 181, 68, 0.1);
+  border-left-color: var(--amber);
+}
+
+.card-foot-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Amber, matching the "capturable/partial" state that surfaces it. */
+.reapply-btn {
+  background: rgba(245, 181, 68, 0.14);
+  border: 1px solid rgba(245, 181, 68, 0.4);
+  color: var(--amber);
+  font-size: 11.5px;
+  padding: 3px 9px;
+}
+.reapply-btn:hover:not(:disabled) { background: rgba(245, 181, 68, 0.22); }
+.reapply-btn:disabled { opacity: 0.6; cursor: default; }
+
 .status {
   display: inline-flex;
   align-items: center;
@@ -383,6 +467,9 @@ body {
 .status.partial .dot { background: var(--amber); }
 .status.not-running { color: var(--text-faint); }
 .status.not-running .dot { background: var(--grey); }
+/* "Can't verify" is an attention state, not a calm one — amber, never grey. */
+.status.unknown { color: var(--amber); }
+.status.unknown .dot { background: var(--amber); }
 
 .icon-toggle-btn {
   background: none;

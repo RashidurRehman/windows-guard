@@ -132,7 +132,14 @@ Write-Host "Wrote hook: $hookPath" -ForegroundColor Green
 
 $already = Select-String -Path $mainJs -Pattern $marker -SimpleMatch -Quiet
 if ($already) {
-    Write-Host "main already loads the hook (marker present)." -ForegroundColor Yellow
+    # The marker being present is NOT proof the patch works: an app update can
+    # leave the loader line while deleting the hook file it points at. Verify the
+    # hook file too, and repair it rather than reporting a false success.
+    if (-not (Test-Path $hookPath)) {
+        Write-Host "Loader present but hook file was missing - rewritten." -ForegroundColor Yellow
+    } else {
+        Write-Host "main already loads the hook (marker present)." -ForegroundColor Yellow
+    }
 } else {
     if (-not (Test-Path $preBak)) { Copy-Item $mainJs $preBak; Write-Host "Backed up original -> $preBak" -ForegroundColor DarkGray }
     if ($isEsm) { $loader = "import('./cg-cp-hook.cjs').catch(function(){{}}); // {0}" -f $marker }

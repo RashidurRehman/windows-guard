@@ -13,8 +13,8 @@ use tauri::{AppHandle, Emitter, Manager};
 use windows::Win32::Foundation::{HMODULE, HWND};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, GetWindowThreadProcessId, TranslateMessage, EVENT_OBJECT_SHOW,
-    MSG, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    DispatchMessageW, GetMessageW, GetWindowThreadProcessId, KillTimer, SetTimer, TranslateMessage,
+    EVENT_OBJECT_SHOW, MSG, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_TIMER,
 };
 
 static APP: OnceLock<AppHandle> = OnceLock::new();
@@ -22,29 +22,118 @@ static APP: OnceLock<AppHandle> = OnceLock::new();
 /// Install the window-show hook on a dedicated thread with its own message loop
 /// (required for out-of-context hook delivery).
 pub fn spawn(app: AppHandle) {
-    let _ = APP.set(app);
-    std::thread::spawn(|| unsafe {
-        let hook = SetWinEventHook(
-            EVENT_OBJECT_SHOW,
-            EVENT_OBJECT_SHOW,
-            HMODULE::default(),
-            Some(win_event_proc),
-            0, // all processes
-            0, // all threads
-            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
-        );
+    let _ = APP.set(app.clone());
+    std::thread::spawn(move || unsafe {
+        let install = || {
+            SetWinEventHook(
+                EVENT_OBJECT_SHOW,
+                EVENT_OBJECT_SHOW,
+                HMODULE::default(),
+                Some(win_event_proc),
+                0, // all processes
+                0, // all threads
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            )
+        };
 
-        // Pump messages so the OS can deliver hook callbacks to this thread.
+        let mut hook = install();
+        if hook.is_invalid() {
+            // Previously this failure was silent: the thread went straight into
+            // its message loop and the app looked healthy while instant
+            // detection did not exist. Say so — the 15s backstop is all that is
+            // left, and the user should know their cover is slower than claimed.
+            crate::push_log(
+                &app,
+                "error",
+                "Instant window detection unavailable — falling back to the periodic check.",
+            );
+        }
+
+        // Re-arm periodically. A WinEvent hook is per-session and can be dropped
+        // by the OS across suspend/resume, a fast user switch, or a desktop
+        // switch, WITHOUT telling us — the thread keeps pumping an empty queue
+        // forever and every app launch silently falls back to the slow poll.
+        // A cheap timer lets us notice and reinstall.
         let mut msg = MSG::default();
-        while GetMessageW(&mut msg, HWND::default(), 0, 0).0 > 0 {
+        let timer = SetTimer(None, 0, REARM_MS, None);
+        loop {
+            let got = GetMessageW(&mut msg, HWND::default(), 0, 0).0;
+            if got <= 0 {
+                break;
+            }
+            if msg.message == WM_TIMER {
+                // Reinstall only when we know we have nothing valid. Hooks that
+                // are still live are left strictly alone — tearing down a
+                // working hook to replace it would open a real gap.
+                if hook.is_invalid() {
+                    hook = install();
+                    if !hook.is_invalid() {
+                        crate::push_log(&app, "info", "Instant window detection restored.");
+                    }
+                } else if !hook_is_alive() {
+                    let _ = UnhookWinEvent(hook);
+                    hook = install();
+                    if !hook.is_invalid() {
+                        crate::push_log(&app, "info", "Instant window detection re-armed.");
+                    }
+                }
+                continue;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
+        }
+        if timer != 0 {
+            let _ = KillTimer(None, timer);
         }
         if !hook.is_invalid() {
             let _ = UnhookWinEvent(hook);
         }
     });
 }
+
+/// How often to check that the window-show hook is still installed.
+const REARM_MS: u32 = 30_000;
+
+/// Has our hook been delivering?
+///
+/// `SetWinEventHook` offers no "is this handle still valid" API, so liveness has
+/// to be inferred, and the inference must be conservative in the right
+/// direction. A quiet desktop (screen locked, user away) legitimately produces
+/// no SHOW events, so "no events" alone does NOT mean the hook died — treating
+/// it that way would reinstall the hook every 30s all night.
+///
+/// So we only suspect the hook when the desktop was demonstrably NOT idle and we
+/// still saw nothing: real user input happened, yet no window-show event
+/// arrived. Reinstalling is idempotent and cheap, so a false positive costs one
+/// syscall, while a false negative costs silent loss of instant protection.
+fn hook_is_alive() -> bool {
+    use std::sync::atomic::Ordering;
+    let seen = EVENTS_SEEN.swap(0, Ordering::Relaxed);
+    if seen > 0 {
+        return true;
+    }
+    // No events. Only call it dead if the user was actually active.
+    idle_millis().map_or(true, |idle| idle >= REARM_MS as u64)
+}
+
+/// Milliseconds since the last real user input, or `None` if it can't be read.
+fn idle_millis() -> Option<u64> {
+    use windows::Win32::System::SystemInformation::GetTickCount;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+    unsafe {
+        let mut lii = LASTINPUTINFO {
+            cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+            dwTime: 0,
+        };
+        if !GetLastInputInfo(&mut lii).as_bool() {
+            return None;
+        }
+        Some(GetTickCount().wrapping_sub(lii.dwTime) as u64)
+    }
+}
+
+/// Counts callbacks between re-arm checks; see `hook_is_alive`.
+static EVENTS_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 unsafe extern "system" fn win_event_proc(
     _hook: HWINEVENTHOOK,
@@ -59,6 +148,9 @@ unsafe extern "system" fn win_event_proc(
     if event != EVENT_OBJECT_SHOW || id_object != 0 || hwnd == HWND::default() {
         return;
     }
+    // Proof-of-life for the re-arm check; counts every delivery, including ones
+    // we go on to ignore, since any delivery means the hook is still installed.
+    EVENTS_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut pid = 0u32;
     GetWindowThreadProcessId(hwnd, Some(&mut pid as *mut u32));
     on_window_shown(hwnd, pid);
@@ -79,7 +171,13 @@ fn on_window_shown(hwnd: HWND, pid: u32) {
 
     let target = {
         let st = app.state::<AppState>();
-        let cfg = st.config.lock().unwrap();
+        // Never unwrap a poisoned lock here: this runs on the WinEvent thread,
+        // and a panic would take instant detection down for the rest of the
+        // session with nothing visible to say so.
+        let cfg = match st.config.lock() {
+            Ok(c) => c,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         if !cfg.master_enabled {
             return;
         }
@@ -111,7 +209,10 @@ fn on_window_shown(hwnd: HWND, pid: u32) {
         std::thread::sleep(std::time::Duration::from_millis(400));
         let st = app2.state::<AppState>();
         let statuses = {
-            let cfg = st.config.lock().unwrap();
+            let cfg = match st.config.lock() {
+                Ok(c) => c,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             crate::snapshot(&cfg)
         };
         let _ = app2.emit("status-update", &statuses);

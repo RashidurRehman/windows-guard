@@ -17,7 +17,14 @@ pub fn spawn(app: AppHandle) {
         loop {
             let (interval, master, targets, engine) = {
                 let st = app.state::<AppState>();
-                let cfg = st.config.lock().unwrap();
+                // A panic anywhere else in the app poisons this mutex. Unwrapping
+                // would kill THIS thread — and a dead monitor is invisible: the UI
+                // keeps showing the last statuses it emitted, which were green.
+                // Recover the data instead and keep self-healing.
+                let cfg = match st.config.lock() {
+                    Ok(cfg) => cfg,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
                 (
                     cfg.interval_secs.max(1),
                     cfg.master_enabled,
@@ -27,19 +34,66 @@ pub fn spawn(app: AppHandle) {
             };
 
             let mut statuses: Vec<TargetStatus> = Vec::with_capacity(targets.len());
+            let mut patch_states: Vec<serde_json::Value> = Vec::with_capacity(targets.len());
             let mut alive: HashSet<u32> = HashSet::new();
 
+            // ONE process-table snapshot for the whole tick. Taking it costs
+            // ~9ms, versus ~0.1ms for an EnumWindows pass, and the old code took
+            // it up to 12 times per tick (twice per target via probe, once more
+            // via pids_for_process) — which is why an idle tray app was burning
+            // over 1% CPU continuously.
+            let pids = winapi::process_snapshot();
+
             for t in &targets {
-                let before = winapi::probe(&t.process, &t.class, &t.title, t.all_windows);
+                let before = winapi::probe_in(&t.process, &t.class, &t.title, t.all_windows, &pids);
                 let active = master && t.enabled;
                 let mut after = before;
 
                 // Track live pids of every target so we can prune hooks for apps
                 // that have since closed.
-                for pid in winapi::pids_for_process(&t.process) {
+                for pid in winapi::pids_for_process_in(&t.process, &pids) {
                     alive.insert(pid);
                 }
 
+                // An electron-patch target's patch can be silently deleted by an
+                // app update. Check the marker ON DISK, independently of what the
+                // probe reports: a still-running instance keeps reading
+                // "Protected" from a patch that no longer exists, so waiting for
+                // the probe to report failure means never noticing at all.
+                if active && t.method == Method::ElectronPatch {
+                    if let Some(false) = crate::actions::electron_patch_present(&t.process) {
+                        let go = last_attempt
+                            .get(&t.id)
+                            .map_or(true, |i| i.elapsed() >= Duration::from_secs(60));
+                        if go {
+                            last_attempt.insert(t.id.clone(), Instant::now());
+                            match engine.apply(t) {
+                                Ok(_) => log_once(
+                                    &app,
+                                    &mut last_msg,
+                                    &t.id,
+                                    "warn",
+                                    &format!(
+                                        "{} was updated and lost its protection patch — \
+                                         re-applied. Fully quit and relaunch {} to activate.",
+                                        t.name, t.name
+                                    ),
+                                ),
+                                Err(e) => log_once(
+                                    &app,
+                                    &mut last_msg,
+                                    &t.id,
+                                    "error",
+                                    &format!("{}: {}", t.name, first_line(&e)),
+                                ),
+                            }
+                        }
+                    }
+                }
+
+                // `NoWindows` still means the process is alive, so keep hooking
+                // it — its windows may simply be minimized to tray, and a hook
+                // placed now covers whatever it opens next.
                 if active && before.status != CaptureStatus::NotRunning {
                     // Re-affirm protection via the signed helper DLL. This hooks any
                     // instance the event watcher missed (e.g. a launch during the
@@ -48,43 +102,43 @@ pub fn spawn(app: AppHandle) {
                     // Electron apps it also keeps native OS dialogs covered.
                     crate::hook::protect_target(&t.process);
 
-                    // Electron: re-run the self-patch (for persistence) only when the
-                    // main window is unprotected — e.g. after a Cursor update wiped it.
                     let needs_fix = matches!(
                         before.status,
                         CaptureStatus::Unprotected | CaptureStatus::Partial
                     );
                     if needs_fix {
-                        // Give the DLL a moment to apply before re-reading status.
+                        // Give the DLL a moment to apply, then re-read. Only
+                        // re-probe when something actually changed — the old code
+                        // paid for a second full probe on every tick.
                         std::thread::sleep(Duration::from_millis(250));
-                    }
-                    after = winapi::probe(&t.process, &t.class, &t.title, t.all_windows);
-                    if t.method == Method::ElectronPatch && needs_fix {
-                        let go = last_attempt
-                            .get(&t.id)
-                            .map_or(true, |i| i.elapsed() >= Duration::from_secs(60));
-                        if go {
-                            last_attempt.insert(t.id.clone(), Instant::now());
-                            if let Err(e) = engine.apply(t) {
-                                let msg = format!("{}: {}", t.name, first_line(&e));
-                                log_once(&app, &mut last_msg, &t.id, "warn", &msg);
-                            }
-                        }
-                    }
+                        after = winapi::probe_in(
+                            &t.process,
+                            &t.class,
+                            &t.title,
+                            t.all_windows,
+                            &pids,
+                        );
 
-                    // Log only when the main window went unprotected -> protected.
-                    if needs_fix {
                         let msg = format!(
-                            "Re-protected {} ({} window{})",
+                            "Re-protected {} ({} of {} window{})",
                             t.name,
                             after.windows_protected,
-                            if after.windows_protected == 1 { "" } else { "s" }
+                            after.windows_total,
+                            if after.windows_total == 1 { "" } else { "s" }
                         );
                         log_once(&app, &mut last_msg, &t.id, "info", &msg);
                     } else {
                         last_msg.remove(&t.id);
                     }
                 }
+
+                // Patch state is emitted alongside (not inside) TargetStatus so
+                // this stays within the monitor's own files; `TargetStatus` is
+                // shared with other call sites.
+                patch_states.push(serde_json::json!({
+                    "id": t.id,
+                    "patch_state": engine.patch_state(t, after.status),
+                }));
 
                 statuses.push(TargetStatus {
                     id: t.id.clone(),
@@ -98,9 +152,16 @@ pub fn spawn(app: AppHandle) {
             crate::hook::prune_dead(alive);
 
             let _ = app.emit("status-update", &statuses);
+            let _ = app.emit("patch-state-update", &patch_states);
             let _ = app.emit(
                 "system-status",
-                serde_json::json!({ "fullscreen_active": winapi::exclusive_fullscreen_active() }),
+                serde_json::json!({
+                    "fullscreen_active": winapi::exclusive_fullscreen_active(),
+                    // Live engine health rides along with every tick so the UI
+                    // banner corrects itself without a reload — hooks can start
+                    // failing long after startup (a target relaunches elevated).
+                    "engine_health": crate::engine_health(),
+                }),
             );
             std::thread::sleep(Duration::from_secs(interval));
         }

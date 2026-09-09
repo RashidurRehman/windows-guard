@@ -38,6 +38,25 @@ pub struct AppState {
     pub installed_cache: Mutex<Option<String>>,
 }
 
+impl AppState {
+    /// Lock the config, surviving a poisoned mutex.
+    ///
+    /// A `Mutex` is poisoned when a thread panics while holding it — and the
+    /// command handlers in this file are the likeliest place for that first
+    /// panic to happen. With a bare `.unwrap()` every subsequent acquisition
+    /// panics on contact, so one unlucky panic would permanently break every
+    /// command the user has for reacting to it, while the background threads
+    /// (already poison-tolerant) kept emitting the last status they computed:
+    /// a frozen green light that nothing can clear.
+    ///
+    /// The config behind the lock is a plain data struct with no cross-field
+    /// invariant that a mid-write panic could tear, so recovering it is safe —
+    /// strictly better than refusing to run.
+    pub fn cfg(&self) -> std::sync::MutexGuard<'_, Config> {
+        self.config.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct LogEntry {
     pub ts_ms: u64,
@@ -61,7 +80,89 @@ pub struct FullState {
     is_elevated: bool,
     elevated_task_installed: bool,
     fullscreen_active: bool,
+    engine_health: EngineHealth,
+    /// Set when the saved config could not be read normally (corrupt and reset,
+    /// or present but unreadable). Silent state loss is exactly what a user must
+    /// be told about, and the log pane is a channel they never read.
+    config_notice: Option<String>,
     log: Vec<LogEntry>,
+}
+
+/// Whether the protection engine can actually protect anything right now.
+///
+/// This exists because the engine used to fail *silently*: an unelevated
+/// instance cannot install its hooks (no SeDebugPrivilege), every
+/// `SetWindowsHookExW` returns access-denied, and nothing anywhere said so —
+/// the UI reported every target as protected while nothing was. Any state
+/// other than `Ready` means the user must be told.
+#[derive(Serialize, Clone, Debug)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum EngineHealth {
+    /// Hook DLL loaded and we have the rights to inject it.
+    Ready,
+    /// The engine could not start at all — nothing is protected.
+    Unavailable { reason: String },
+    /// The engine started but cannot protect everything it was asked to
+    /// (e.g. running unelevated, so elevated targets refuse the hook).
+    Degraded { reason: String },
+}
+
+static ENGINE_HEALTH: Mutex<Option<EngineHealth>> = Mutex::new(None);
+
+/// A one-off warning about the config that was loaded at startup (corrupt and
+/// reset, or unreadable). Held so `get_state` can surface it in the UI rather
+/// than it existing only as a log line that scrolls away unread.
+static CONFIG_NOTICE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Record the startup config warning, if there was one.
+pub fn set_config_notice(notice: Option<String>) {
+    if let Ok(mut slot) = CONFIG_NOTICE.lock() {
+        *slot = notice;
+    }
+}
+
+/// The startup config warning, if any.
+pub fn config_notice() -> Option<String> {
+    CONFIG_NOTICE.lock().ok().and_then(|s| s.clone())
+}
+
+/// Record the engine's health. Called once at startup and again whenever a
+/// condition that changes it is observed.
+pub fn set_engine_health(h: EngineHealth) {
+    if let Ok(mut slot) = ENGINE_HEALTH.lock() {
+        *slot = Some(h);
+    }
+}
+
+/// Current engine health, defaulting to `Unavailable` until startup sets it —
+/// never optimistically `Ready`, so a startup that dies before wiring this up
+/// cannot present itself as healthy.
+///
+/// `Unavailable` and `Degraded` are sticky decisions made at startup; on top of
+/// those we fold in the hook engine's LIVE view, because targets fail after
+/// startup too (an app relaunches elevated, a 32-bit target appears). A stored
+/// `Ready` is therefore only reported when nothing is currently failing.
+pub fn engine_health() -> EngineHealth {
+    let stored = ENGINE_HEALTH
+        .lock()
+        .ok()
+        .and_then(|s| s.clone())
+        .unwrap_or(EngineHealth::Unavailable {
+            reason: "Protection engine has not started yet.".into(),
+        });
+    match stored {
+        // Already the worst news — nothing to add.
+        EngineHealth::Unavailable { .. } | EngineHealth::Degraded { .. } => stored,
+        // The engine came up; ask it whether it is actually protecting things.
+        // hook::degraded_reason() aggregates per target (a target counts as
+        // failed only when NONE of its GUI threads hooked) and its wording
+        // distinguishes a privilege problem from a bitness one, so it is passed
+        // through verbatim rather than re-worded here.
+        EngineHealth::Ready => match hook::degraded_reason() {
+            Some(reason) => EngineHealth::Degraded { reason },
+            None => EngineHealth::Ready,
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -98,6 +199,32 @@ pub fn push_log(app: &AppHandle, level: &str, message: &str) {
     }
     let _ = app.emit("log", &entry);
 }
+
+// THE LOGON-START INVARIANT. Exactly one mechanism may start Windows Guard at
+// logon:
+//
+//   * `elevated_mode` ON  -> the scheduled task owns logon start, and the
+//     `HKCU\...\Run` key MUST stay absent.
+//   * `elevated_mode` OFF -> the Run key owns logon start, and follows
+//     `start_on_login`.
+//
+// `start_on_login` records the user's INTENT ("start at logon"); which of the
+// two mechanisms carries it out is decided solely by `elevated_mode`. Never
+// clear the intent when switching mechanism, and never let both mechanisms be
+// registered at once.
+//
+// Why it matters: the Run key always launches an UNELEVATED copy (that hive
+// uses the plain user token) and fires at the same instant as the task's logon
+// trigger. With both registered they race, and an unelevated instance cannot
+// install its hooks — so it runs looking perfectly healthy while protecting
+// nothing. That was the app's headline bug: "after a reboot everything is
+// captureable". Registering the Run key alongside the task rebuilds it.
+//
+// Enforced at four places, all of which must agree:
+//   1. `resolve_logon_ownership()` — removes the Run key before the builder.
+//   2. `setup()`'s autostart reconcile — re-asserts it via the plugin.
+//   3. `set_autostart()` — refuses to write the key in elevated mode.
+//   4. `set_elevated_mode()` — switches mechanism, preserves intent both ways.
 
 /// Compute live protection status for every configured target (native, cheap).
 pub fn snapshot(cfg: &Config) -> Vec<TargetStatus> {
@@ -139,7 +266,7 @@ pub(crate) fn engage_target(app: &AppHandle, target: Target, enable: bool) {
             Err(e) => push_log(&app, "error", &format!("{}: {}", target.name, first_line(&e))),
         }
         let statuses = {
-            let cfg = st.config.lock().unwrap();
+            let cfg = st.cfg();
             snapshot(&cfg)
         };
         let _ = app.emit("status-update", &statuses);
@@ -149,7 +276,7 @@ pub(crate) fn engage_target(app: &AppHandle, target: Target, enable: bool) {
 fn save_config(app: &AppHandle) {
     let st = app.state::<AppState>();
     let dir = st.config_dir.clone();
-    let cfg = st.config.lock().unwrap();
+    let cfg = st.cfg();
     let _ = cfg.save(&dir);
 }
 
@@ -174,10 +301,18 @@ fn slug(name: &str) -> String {
 #[tauri::command]
 fn get_state(app: AppHandle) -> FullState {
     let st = app.state::<AppState>();
-    let config = st.config.lock().unwrap().clone();
+    let config = st.cfg().clone();
     let statuses = snapshot(&config);
     let log = st.log.lock().unwrap().iter().cloned().collect();
-    let autostart_enabled = app.autolaunch().is_enabled().unwrap_or(false);
+    // In elevated mode the scheduled task starts us at logon and the HKCU\Run
+    // key is deliberately absent, so the plugin reports "not enabled" even
+    // though start-on-login genuinely is. Trust the saved preference there, or
+    // the settings toggle renders itself off on every load.
+    let autostart_enabled = if config.elevated_mode {
+        config.start_on_login
+    } else {
+        app.autolaunch().is_enabled().unwrap_or(false)
+    };
     FullState {
         config,
         statuses,
@@ -185,6 +320,8 @@ fn get_state(app: AppHandle) -> FullState {
         is_elevated: privilege::is_elevated(),
         elevated_task_installed: elevate::task_installed(),
         fullscreen_active: winapi::exclusive_fullscreen_active(),
+        engine_health: engine_health(),
+        config_notice: config_notice(),
         log,
     }
 }
@@ -192,7 +329,7 @@ fn get_state(app: AppHandle) -> FullState {
 #[tauri::command]
 fn refresh_now(app: AppHandle) -> Vec<TargetStatus> {
     let st = app.state::<AppState>();
-    let cfg = st.config.lock().unwrap();
+    let cfg = st.cfg();
     let statuses = snapshot(&cfg);
     let _ = app.emit("status-update", &statuses);
     statuses
@@ -202,7 +339,7 @@ fn refresh_now(app: AppHandle) -> Vec<TargetStatus> {
 fn set_master(app: AppHandle, enabled: bool) -> Vec<TargetStatus> {
     let targets: Vec<Target> = {
         let st = app.state::<AppState>();
-        let mut cfg = st.config.lock().unwrap();
+        let mut cfg = st.cfg();
         cfg.master_enabled = enabled;
         cfg.targets.clone()
     };
@@ -220,7 +357,7 @@ fn set_master(app: AppHandle, enabled: bool) -> Vec<TargetStatus> {
         engage_target(&app, t.clone(), enabled);
     }
     let st = app.state::<AppState>();
-    let cfg = st.config.lock().unwrap();
+    let cfg = st.cfg();
     snapshot(&cfg)
 }
 
@@ -228,7 +365,7 @@ fn set_master(app: AppHandle, enabled: bool) -> Vec<TargetStatus> {
 fn set_target_enabled(app: AppHandle, id: String, enabled: bool) -> Result<Vec<TargetStatus>, String> {
     let (target, master) = {
         let st = app.state::<AppState>();
-        let mut cfg = st.config.lock().unwrap();
+        let mut cfg = st.cfg();
         let t = cfg.find_mut(&id).ok_or("unknown app")?;
         t.enabled = enabled;
         (t.clone(), cfg.master_enabled)
@@ -238,14 +375,14 @@ fn set_target_enabled(app: AppHandle, id: String, enabled: bool) -> Result<Vec<T
         engage_target(&app, target, enabled);
     }
     let st = app.state::<AppState>();
-    let cfg = st.config.lock().unwrap();
+    let cfg = st.cfg();
     Ok(snapshot(&cfg))
 }
 
 #[tauri::command]
 fn set_target_show_icon(app: AppHandle, id: String, show_icon: bool) -> Result<Config, String> {
     let st = app.state::<AppState>();
-    let mut cfg = st.config.lock().unwrap();
+    let mut cfg = st.cfg();
     let t = cfg.find_mut(&id).ok_or("unknown app")?;
     t.show_icon = show_icon;
     let _ = cfg.save(&st.config_dir);
@@ -253,15 +390,15 @@ fn set_target_show_icon(app: AppHandle, id: String, show_icon: bool) -> Result<C
 }
 
 #[tauri::command]
-fn focus_main_window(app: AppHandle) {
-    show_main(&app);
+fn focus_main_window(app: AppHandle) -> bool {
+    show_main(&app)
 }
 
 #[tauri::command]
 fn protect_now(app: AppHandle, id: String) -> Result<String, String> {
     let (target, engine) = {
         let st = app.state::<AppState>();
-        let cfg = st.config.lock().unwrap();
+        let cfg = st.cfg();
         let t = cfg.find(&id).ok_or("unknown app")?.clone();
         (t, st.engine.clone())
     };
@@ -269,7 +406,7 @@ fn protect_now(app: AppHandle, id: String) -> Result<String, String> {
     push_log(&app, "info", &format!("Manually protected {}", target.name));
     let statuses = {
         let st = app.state::<AppState>();
-        let cfg = st.config.lock().unwrap();
+        let cfg = st.cfg();
         snapshot(&cfg)
     };
     let _ = app.emit("status-update", &statuses);
@@ -280,7 +417,7 @@ fn protect_now(app: AppHandle, id: String) -> Result<String, String> {
 fn unprotect_now(app: AppHandle, id: String) -> Result<String, String> {
     let (target, engine) = {
         let st = app.state::<AppState>();
-        let cfg = st.config.lock().unwrap();
+        let cfg = st.cfg();
         let t = cfg.find(&id).ok_or("unknown app")?.clone();
         (t, st.engine.clone())
     };
@@ -288,7 +425,7 @@ fn unprotect_now(app: AppHandle, id: String) -> Result<String, String> {
     push_log(&app, "info", &format!("Manually removed protection from {}", target.name));
     let statuses = {
         let st = app.state::<AppState>();
-        let cfg = st.config.lock().unwrap();
+        let cfg = st.cfg();
         snapshot(&cfg)
     };
     let _ = app.emit("status-update", &statuses);
@@ -323,7 +460,7 @@ fn add_target(app: AppHandle, target: NewTarget) -> Result<Config, String> {
     };
 
     let st = app.state::<AppState>();
-    let mut cfg = st.config.lock().unwrap();
+    let mut cfg = st.cfg();
     // unique id
     let mut id = slug(&name);
     let mut n = 2;
@@ -354,7 +491,7 @@ fn add_target(app: AppHandle, target: NewTarget) -> Result<Config, String> {
 fn remove_target(app: AppHandle, id: String) -> Result<Config, String> {
     let (removed, cfg_clone) = {
         let st = app.state::<AppState>();
-        let mut cfg = st.config.lock().unwrap();
+        let mut cfg = st.cfg();
         let idx = cfg
             .targets
             .iter()
@@ -382,7 +519,7 @@ struct Settings {
 #[tauri::command]
 fn update_settings(app: AppHandle, settings: Settings) -> Config {
     let st = app.state::<AppState>();
-    let mut cfg = st.config.lock().unwrap();
+    let mut cfg = st.cfg();
     if let Some(iv) = settings.interval_secs {
         cfg.interval_secs = iv.clamp(1, 60);
     }
@@ -395,15 +532,26 @@ fn update_settings(app: AppHandle, settings: Settings) -> Config {
 
 #[tauri::command]
 fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
+    // In elevated mode the scheduled task owns logon start, and the HKCU\Run
+    // key must stay gone: registering both makes them race, and the Run key's
+    // copy is always unelevated (that hive uses the plain user token), so it
+    // can win the race and leave an instance running that cannot protect
+    // anything. Writing the key here would recreate exactly the racer that
+    // `resolve_logon_ownership()` removes at every start.
+    let elevated_mode = app.state::<AppState>().cfg().elevated_mode;
+
     let mgr = app.autolaunch();
-    if enabled {
+    if enabled && !elevated_mode {
         mgr.enable().map_err(|e| e.to_string())?;
     } else {
+        // Elevated mode: the task already starts us at logon, so honour the
+        // user's "start on login" preference by recording it without adding a
+        // second launcher.
         mgr.disable().map_err(|e| e.to_string())?;
     }
     {
         let st = app.state::<AppState>();
-        let mut cfg = st.config.lock().unwrap();
+        let mut cfg = st.cfg();
         cfg.start_on_login = enabled;
         let _ = cfg.save(&st.config_dir);
     }
@@ -416,6 +564,13 @@ fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
             "Start on login disabled"
         },
     );
+    // In elevated mode the Run key is deliberately absent — the scheduled task
+    // starts us instead — so `is_enabled()` reads false even though start-on-
+    // login is genuinely on. Reporting that would make the toggle flip itself
+    // back off in front of the user. The saved preference is the truth here.
+    if elevated_mode {
+        return Ok(enabled);
+    }
     Ok(mgr.is_enabled().unwrap_or(enabled))
 }
 
@@ -462,20 +617,33 @@ fn parse_apps(json: &str) -> Result<serde_json::Value, String> {
 #[tauri::command]
 fn set_elevated_mode(app: AppHandle, enabled: bool) -> Result<bool, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    // Does the user currently want to start at logon? The mechanism changes
+    // with elevated mode, but the preference itself must survive the switch.
+    let wants_autostart = app.state::<AppState>().cfg().start_on_login;
+
     if enabled {
         elevate::install_task(&exe)?;
-        // Elevated auto-start supersedes the normal (non-elevated) Run entry.
+        // The task now owns logon start; the Run key would be a second,
+        // unelevated racer for it, so it goes.
         let _ = app.autolaunch().disable();
     } else {
         elevate::remove_task()?;
+        // Hand logon start back to the Run key, otherwise turning elevated mode
+        // off would silently leave NOTHING starting the app: the task is gone
+        // and the key was removed when elevated mode was turned on.
+        if wants_autostart {
+            let _ = app.autolaunch().enable();
+        }
     }
     {
         let st = app.state::<AppState>();
-        let mut cfg = st.config.lock().unwrap();
+        let mut cfg = st.cfg();
         cfg.elevated_mode = enabled;
-        if enabled {
-            cfg.start_on_login = false;
-        }
+        // `start_on_login` is deliberately NOT cleared when enabling: it records
+        // the user's intent, and the scheduled task is what carries it out in
+        // elevated mode. Clearing it made the settings toggle read "off" while
+        // the app was in fact still starting at every logon, and left the user
+        // with no autostart at all if they later turned elevated mode back off.
         let _ = cfg.save(&st.config_dir);
     }
     push_log(
@@ -506,9 +674,35 @@ fn restart_elevated(app: AppHandle) -> Result<(), String> {
 /// replace the exe. Our own code never gets a chance to run after that
 /// happens, so hooks must be cleanly removed here, first — see the note on
 /// `hook::shutdown()`.
+///
+/// An update that FAILS, though, leaves this process alive with every hook torn
+/// down and no code path that puts them back: protection would be silently off
+/// until the next restart while the UI still showed green. So we arm a watchdog
+/// — if we're still running a few seconds later, the install didn't take, and
+/// protection is restored.
 #[tauri::command]
-fn prepare_for_update_install() {
+fn prepare_for_update_install(app: AppHandle) {
     hook::shutdown();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        // Still here => `update.install()` never replaced us. Bring the engine
+        // back up and re-protect everything the config asks for.
+        if hook::init().is_ok() {
+            let targets = {
+                let st = app.state::<AppState>();
+                let cfg = st.cfg();
+                cfg.master_enabled.then(|| cfg.targets.clone())
+            };
+            for t in targets.into_iter().flatten().filter(|t| t.enabled) {
+                hook::protect_target(&t.process);
+            }
+        }
+        push_log(
+            &app,
+            "warn",
+            "Update did not install — protection has been re-applied.",
+        );
+    });
 }
 
 #[tauri::command]
@@ -518,7 +712,7 @@ fn set_self_protection(app: AppHandle, enabled: bool) -> Result<bool, String> {
     }
     {
         let st = app.state::<AppState>();
-        let mut cfg = st.config.lock().unwrap();
+        let mut cfg = st.cfg();
         cfg.protect_self = enabled;
         let _ = cfg.save(&st.config_dir);
     }
@@ -539,7 +733,7 @@ fn set_privacy_veil(app: AppHandle, enabled: bool) -> Result<wablur::WaBlurStatu
     wablur::set_enabled(enabled);
     {
         let st = app.state::<AppState>();
-        let mut cfg = st.config.lock().unwrap();
+        let mut cfg = st.cfg();
         cfg.privacy_veil = enabled;
         let _ = cfg.save(&st.config_dir);
     }
@@ -573,7 +767,7 @@ struct ActivitySettings {
 
 #[tauri::command]
 fn get_activity_config(app: AppHandle) -> ActivityConfig {
-    app.state::<AppState>().config.lock().unwrap().activity.clone()
+    app.state::<AppState>().cfg().activity.clone()
 }
 
 #[tauri::command]
@@ -585,7 +779,7 @@ fn get_activity_status(app: AppHandle) -> activity::ActivityStatus {
 fn set_activity_config(app: AppHandle, settings: ActivitySettings) -> ActivityConfig {
     let cfg = {
         let st = app.state::<AppState>();
-        let mut c = st.config.lock().unwrap();
+        let mut c = st.cfg();
         let a = &mut c.activity;
         if let Some(v) = settings.enabled {
             a.enabled = v;
@@ -632,7 +826,7 @@ fn add_safe_key(app: AppHandle, label: String, vks: Vec<u16>) -> Result<Activity
         return Err("Give this key combo a name".into());
     }
     let st = app.state::<AppState>();
-    let mut c = st.config.lock().unwrap();
+    let mut c = st.cfg();
     if c.activity.safe_keys.iter().any(|k| k.label == label) {
         return Err("A key with that name already exists".into());
     }
@@ -647,7 +841,7 @@ fn add_safe_key(app: AppHandle, label: String, vks: Vec<u16>) -> Result<Activity
 #[tauri::command]
 fn remove_safe_key(app: AppHandle, label: String) -> ActivityConfig {
     let st = app.state::<AppState>();
-    let mut c = st.config.lock().unwrap();
+    let mut c = st.cfg();
     c.activity.safe_keys.retain(|k| k.label != label);
     let _ = c.save(&st.config_dir);
     c.activity.clone()
@@ -666,7 +860,7 @@ struct SyncSettings {
 
 #[tauri::command]
 fn get_sync_config(app: AppHandle) -> SyncConfig {
-    app.state::<AppState>().config.lock().unwrap().sync_monitor.clone()
+    app.state::<AppState>().cfg().sync_monitor.clone()
 }
 
 #[tauri::command]
@@ -678,7 +872,7 @@ fn get_sync_status(app: AppHandle) -> syncmon::SyncStatus {
 fn set_sync_config(app: AppHandle, settings: SyncSettings) -> SyncConfig {
     let cfg = {
         let st = app.state::<AppState>();
-        let mut c = st.config.lock().unwrap();
+        let mut c = st.cfg();
         let s = &mut c.sync_monitor;
         if let Some(v) = settings.enabled {
             s.enabled = v;
@@ -723,7 +917,7 @@ fn add_sync_tracker(app: AppHandle, name: String) -> Result<SyncConfig, String> 
         return Err("Enter a process name".into());
     }
     let st = app.state::<AppState>();
-    let mut c = st.config.lock().unwrap();
+    let mut c = st.cfg();
     if c.sync_monitor.known_trackers.iter().any(|n| n.eq_ignore_ascii_case(&name))
         || c.sync_monitor.custom_trackers.iter().any(|n| n.eq_ignore_ascii_case(&name))
     {
@@ -740,7 +934,7 @@ fn add_sync_tracker(app: AppHandle, name: String) -> Result<SyncConfig, String> 
 #[tauri::command]
 fn remove_sync_tracker(app: AppHandle, name: String) -> SyncConfig {
     let st = app.state::<AppState>();
-    let mut c = st.config.lock().unwrap();
+    let mut c = st.cfg();
     c.sync_monitor.custom_trackers.retain(|n| !n.eq_ignore_ascii_case(&name));
     let _ = c.save(&st.config_dir);
     c.sync_monitor.clone()
@@ -751,7 +945,7 @@ fn set_sync_paused(app: AppHandle, paused: bool) -> syncmon::SyncStatus {
     syncmon::set_paused(paused);
     {
         let st = app.state::<AppState>();
-        let mut c = st.config.lock().unwrap();
+        let mut c = st.cfg();
         c.sync_monitor.paused = paused;
         let _ = c.save(&st.config_dir);
     }
@@ -873,12 +1067,94 @@ fn open_config_folder(app: AppHandle) {
 // Tray + window
 // ---------------------------------------------------------------------------
 
-fn show_main(app: &AppHandle) {
-    if let Some(w) = app.get_webview_window("main") {
-        let _ = w.show();
-        let _ = w.unminimize();
-        let _ = w.set_focus();
+/// Bring the main window up from ANY state, and verify it actually happened.
+///
+/// The old version called `show()`/`unminimize()`/`set_focus()` and discarded
+/// all three Results, so a failure was completely invisible: the tray click ran
+/// this, nothing appeared, and nothing was logged. Two things make that failure
+/// mode real rather than theoretical:
+///
+///   * `show()` goes through Tauri's async path, so its error is dropped even
+///     when it is returned;
+///   * we normally run ELEVATED while explorer.exe (which delivers the tray
+///     click) does not, and UIPI blocks the foreground hand-off between them.
+///
+/// So we do not trust return values here. After asking Tauri nicely we check
+/// the window's REAL state with `IsWindowVisible` and, if it is still hidden,
+/// fall back to a direct `ShowWindow` on our own HWND — a synchronous user32
+/// call with no IPC in the way. Focus is treated as best-effort and is never
+/// allowed to make the call report failure: a visible-but-unfocused window is
+/// a good outcome, an invisible one is the bug we are fixing.
+///
+/// Returns true if the window ended up visible.
+fn show_main(app: &AppHandle) -> bool {
+    let Some(w) = app.get_webview_window("main") else {
+        push_log(app, "error", "Cannot open window: main window not found");
+        return false;
+    };
+
+    // Ask Tauri first — it keeps the webview's own state in sync.
+    let _ = w.unminimize();
+    let _ = w.show();
+
+    // Ground truth: what does the OS actually say? Anything else is a guess.
+    let hwnd = w.hwnd().ok().map(|h| winapi::hwnd_from_raw(h.0 as isize));
+    let visible = match hwnd {
+        Some(h) => {
+            if !winapi::is_window_visible(h) || winapi::is_window_minimized(h) {
+                // Tauri's show() didn't take. Go straight at the HWND.
+                winapi::show_window_native(h);
+            }
+            winapi::is_window_visible(h)
+        }
+        // No HWND to check against: fall back to Tauri's own view.
+        None => w.is_visible().unwrap_or(false),
+    };
+
+    if !visible {
+        push_log(
+            app,
+            "error",
+            "Window did not become visible (show and native fallback both failed)",
+        );
+        return false;
     }
+
+    // Visible now. Focus is best-effort — under UIPI the activation can stay
+    // refused, and force_foreground's last resort still raises the window so
+    // the user can see and click it.
+    let _ = w.set_focus();
+    if let Some(h) = hwnd {
+        if !winapi::force_foreground(h) {
+            push_log(
+                app,
+                "warn",
+                "Window shown but could not take focus (foreground refused) — raised instead",
+            );
+        }
+    }
+    true
+}
+
+/// Tray left-click behaviour: show when hidden, hide when already in front.
+fn toggle_main(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let visible = match w.hwnd().ok().map(|h| winapi::hwnd_from_raw(h.0 as isize)) {
+            Some(h) => winapi::is_window_visible(h) && !winapi::is_window_minimized(h),
+            None => w.is_visible().unwrap_or(false),
+        };
+        // Only fold away a window that is genuinely in front. If it is visible
+        // but buried behind something else, the click means "bring it to me",
+        // not "hide it".
+        if visible {
+            let focused = w.is_focused().unwrap_or(false);
+            if focused {
+                let _ = w.hide();
+                return;
+            }
+        }
+    }
+    show_main(app);
 }
 
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
@@ -899,11 +1175,13 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
-            "open" => show_main(app),
+            "open" => {
+                show_main(app);
+            }
             "pause" => {
                 let enabled = {
                     let st = app.state::<AppState>();
-                    let cfg = st.config.lock().unwrap();
+                    let cfg = st.cfg();
                     cfg.master_enabled
                 };
                 let _ = set_master(app.clone(), !enabled);
@@ -922,7 +1200,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                 ..
             } = event
             {
-                show_main(&tray.app_handle());
+                toggle_main(&tray.app_handle());
             }
         })
         .build(app)?;
@@ -934,8 +1212,121 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 // ---------------------------------------------------------------------------
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// Settle which copy of Windows Guard owns this logon, before the Tauri builder
+/// (and therefore the single-instance lock) exists.
+///
+/// The bug this fixes: two independent mechanisms started us at logon — the
+/// HKCU\Run key (always UNELEVATED, because that key uses the plain user token)
+/// and the scheduled task (elevated). Both fired at once. The Run key's copy
+/// called `schtasks /Run`, collided with the task's own LogonTrigger, got
+/// ERROR_TASK_ALREADY_RUNNING, read that as a FAILED hand-off and so did not
+/// exit. An unelevated instance cannot install its hooks — SetWindowsHookExW
+/// returns access-denied without SeDebugPrivilege — so every target stayed
+/// capturable while the UI cheerfully reported them protected.
+///
+/// Runs before `setup()` because the single-instance plugin kills whichever
+/// process starts second: if the unelevated copy took that lock first, the
+/// elevated copy would be killed as a duplicate and the bug would become
+/// permanent.
+fn resolve_logon_ownership() {
+    // Read the config directly. Tauri's path resolver isn't available this
+    // early, and this must not depend on anything the builder sets up.
+    let Some(config_dir) = std::env::var("APPDATA").ok().map(|a| {
+        std::path::PathBuf::from(a).join("com.rashid.capture-guard")
+    }) else {
+        return;
+    };
+    let config = Config::load_or_default(&config_dir);
+    if !config.elevated_mode {
+        // The user opted out of elevated mode, so the Run key legitimately owns
+        // logon. Nothing to arbitrate, and nothing to clean up.
+        return;
+    }
+
+    // Drop the HKCU\Run entry NOW, before the single-instance lock exists —
+    // and do it whatever our own elevation is. It is the second racer: it
+    // starts an unelevated copy at every logon, and if that copy reaches the
+    // builder first it takes the lock and the ELEVATED copy is killed as the
+    // duplicate, which is precisely the bug this function exists to prevent.
+    //
+    // Doing this before the `is_elevated()` return matters. On a healthy
+    // machine the elevated copy is the one that survives, so it is the only
+    // instance that ever gets here — gate this on being unelevated and the
+    // stale key is only ever removed on the boots where the user is ALREADY
+    // broken, and survives indefinitely on the boots where it still needs to
+    // go. Deleting an HKCU value needs no elevation, is idempotent, and a
+    // missing value is not an error, so it is safe to run unconditionally.
+    // (`app.autolaunch()` can't be used here — no AppHandle exists yet.)
+    elevate::remove_run_key();
+
+    if privilege::is_elevated() {
+        // We're already the elevated copy: the hand-off below is for handing
+        // control TO such a copy, so there is nothing left to arbitrate.
+        return;
+    }
+
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+
+    // Make sure the task exists. On first run this is the ONE UAC prompt the
+    // user ever sees; if they decline we carry on unelevated rather than
+    // getting stuck, and don't retry until the next launch.
+    let mut have_task = elevate::task_installed();
+    if !have_task {
+        have_task = elevate::install_task(&exe).is_ok();
+    }
+    if !have_task {
+        return;
+    }
+
+    // Hand off to the elevated copy and step aside — but only once we've
+    // confirmed it actually exists. `schtasks /Run` returns as soon as the
+    // request is QUEUED, not when the process has started, so exiting on its
+    // return alone can leave zero instances running: the user's app would
+    // simply be gone after logon.
+    if elevate::run_task_now().is_ok()
+        && elevate::wait_for_other_instance(&exe, std::time::Duration::from_secs(10))
+    {
+        // No hooks to release: this runs before the engine starts.
+        std::process::exit(0);
+    }
+    // Fall through: no elevated copy appeared. Keep running unelevated so the
+    // user has *something*, and let setup() raise the engine-health banner
+    // explaining that it cannot protect anything.
+}
+
 pub fn run() {
+    // Decide who owns this logon BEFORE the single-instance plugin can act.
+    //
+    // The plugin kills whichever process starts SECOND. On an existing install
+    // the stale HKCU\Run key is still there, and its copy is unelevated: if it
+    // wins the race it would take the single-instance lock and the elevated
+    // copy from the scheduled task would be killed as a duplicate — locking in
+    // the exact bug we're fixing, permanently. The Run key is therefore removed
+    // in here, before any lock exists, and an unelevated copy stands aside for
+    // the elevated one rather than claiming the lock.
+    resolve_logon_ownership();
+
     tauri::Builder::default()
+        // MUST be the first plugin registered. Two instances of Windows Guard
+        // must never run at once: they would fight over the same hooks and the
+        // same config file. Nothing in-process used to arbitrate this — the app
+        // relied entirely on the scheduled task's MultipleInstancesPolicy, which
+        // cannot see an instance the Run key started.
+        //
+        // The second instance exits and its argv is handed to the one already
+        // running, which surfaces its window — so double-clicking the exe while
+        // it sits in the tray brings it up instead of doing nothing.
+        //
+        // This deliberately does NOT interfere with the elevation hand-off in
+        // `setup()`: the hand-off runs an ELEVATED copy, and this callback fires
+        // in the *existing* process. When the unelevated launcher hands off, it
+        // has already exited by the time the elevated copy is up, so the
+        // elevated copy is not treated as a second instance.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            show_main(app);
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
@@ -990,65 +1381,65 @@ pub fn run() {
             let handle = app.handle().clone();
 
             // Resolve the app config dir; install the engine scripts beside it.
-            let config_dir = app
-                .path()
-                .app_config_dir()
-                .expect("no app config dir");
-            let engine = Engine::install(&config_dir.join("engine"))
-                .expect("failed to install engine scripts");
-            let config = Config::load_or_default(&config_dir);
-
-            // Elevated mode means EVERY start of Windows Guard should end up
-            // running elevated, not just the one at logon. If we're not
-            // currently elevated, hand off to the already-registered logon
-            // task right now — Task Scheduler lets an unelevated process
-            // trigger a task pre-authorized with highest privileges, with no
-            // new UAC prompt — then exit so only the elevated copy survives.
-            // Skip silently if the hand-off fails (e.g. task missing); the
-            // app just continues unelevated rather than getting stuck.
-            if config.elevated_mode && !privilege::is_elevated() && elevate::task_installed() {
-                if elevate::run_task_now().is_ok() {
-                    std::process::exit(0);
+            // Neither step may be fatal: this runs before the tray exists, so a
+            // panic here kills the process with no window, no tray icon and no
+            // error the user can see — indistinguishable from "it just didn't
+            // start".
+            let config_dir = app.path().app_config_dir().unwrap_or_else(|_| {
+                std::env::var("APPDATA")
+                    .map(|a| std::path::PathBuf::from(a).join("com.rashid.capture-guard"))
+                    .unwrap_or_else(|_| std::env::temp_dir().join("com.rashid.capture-guard"))
+            });
+            let engine_result = Engine::install(&config_dir.join("engine"));
+            let engine_error = engine_result
+                .as_ref()
+                .err()
+                .map(|e| first_line(&e.to_string()));
+            // Engine is just a bundle of script paths. If writing them out
+            // failed, still point at where they would be: every use shells out
+            // to PowerShell and returns a normal Err, so a missing script
+            // degrades that one action instead of killing startup.
+            let engine = engine_result.unwrap_or_else(|_| {
+                let dir = config_dir.join("engine");
+                Engine {
+                    electron_ps: dir.join("Enable-ElectronContentProtection.ps1"),
+                    hide_ps: dir.join("Protect-WhatsAppCapture.ps1"),
+                    apps_ps: dir.join("List-InstalledApps.ps1"),
+                    icons_ps: dir.join("Get-AppIcons.ps1"),
                 }
-            }
+            });
+            // Whether a config already existed must be sampled BEFORE anything can
+            // write one, otherwise "is this the first launch?" answers itself
+            // wrongly. Read once here; used below for `start_minimized`.
+            let config_existed = Config::config_path(&config_dir).exists();
+            // `load_reporting` distinguishes a genuine first run from a config
+            // that is corrupt (renamed aside) or merely unreadable (defaults
+            // used in memory, the file left alone). Silently starting on
+            // defaults is how a user loses every target they configured without
+            // ever being told, so the warning is surfaced rather than dropped.
+            let (config, config_warning) = Config::load_reporting(&config_dir);
 
-            // First run with elevated mode on (the default) but the logon task
-            // doesn't exist yet: register it now — this is the ONE UAC prompt
-            // the user ever sees. If they approve, hand off immediately so this
-            // unelevated instance never shows a window; if they decline, we
-            // just continue running unelevated rather than getting stuck (and
-            // don't retry until the next launch, so declining isn't naggy).
-            if config.elevated_mode && !privilege::is_elevated() && !elevate::task_installed() {
-                if let Ok(exe) = std::env::current_exe() {
-                    if elevate::install_task(&exe).is_ok() && elevate::run_task_now().is_ok() {
-                        std::process::exit(0);
-                    }
-                }
-            }
-
-            // Rename migration: clean up any scheduled task from a prior
-            // product name, and if elevated mode is on but the (new-name)
-            // logon task doesn't exist yet, register it now. Both no-ops
-            // unless we're already elevated (e.g. launched by the OLD task at
-            // logon), in which case they happen with zero extra UAC prompts.
-            elevate::cleanup_retired_tasks();
-            if config.elevated_mode && privilege::is_elevated() && !elevate::task_installed() {
-                if let Ok(exe) = std::env::current_exe() {
-                    let _ = elevate::install_task(&exe);
-                }
-            }
-
-            // Reconcile autostart with the saved preference.
-            let mgr = app.autolaunch();
-            if config.start_on_login {
-                let _ = mgr.enable();
-            }
-
-            let start_minimized =
-                config.start_minimized || std::env::args().any(|a| a == "--minimized");
+            // AppState is managed FIRST: every #[tauri::command] panics on an
+            // unmanaged state, and the elevation hand-off below shells out to
+            // schtasks, which can take seconds. Nothing above this line touches
+            // state, so there is no window where a command can arrive early.
+            let elevated_mode = config.elevated_mode;
+            let start_on_login = config.start_on_login;
             let protect_self = config.protect_self;
             let privacy_veil = config.privacy_veil;
             let activity_enabled = config.activity.enabled;
+            // The persisted preference is authoritative. `--minimized` is only a
+            // hint for the very first launch (before the user has a saved config):
+            // treating it as an override meant an autostart launch forced the
+            // window hidden even after the user switched "start minimized" OFF,
+            // so their toggle looked broken. The flag can still arrive from a
+            // manual launch or a legacy Run-key entry, so we keep honouring it —
+            // just not at the expense of an explicit choice.
+            let start_minimized = if config_existed {
+                config.start_minimized
+            } else {
+                config.start_minimized || std::env::args().any(|a| a == "--minimized")
+            };
 
             app.manage(AppState {
                 config: Mutex::new(config),
@@ -1058,7 +1449,71 @@ pub fn run() {
                 installed_cache: Mutex::new(None),
             });
 
-            build_tray(&handle)?;
+            if let Some(e) = engine_error {
+                push_log(&handle, "error", &format!("Engine scripts unavailable: {e}"));
+            }
+            if let Some(w) = &config_warning {
+                push_log(&handle, "warn", w);
+            }
+            set_config_notice(config_warning);
+
+            // --- who starts us at logon ------------------------------------
+            //
+            // Exactly ONE mechanism may do it. With elevated mode on that is the
+            // scheduled task, and the HKCU\Run key must be gone — registering
+            // both makes them race. The Run key's copy is always UNELEVATED
+            // (HKCU\Run uses the plain user token); it fires at the same moment
+            // as the task's LogonTrigger, so its `run_task_now()` collides with
+            // MultipleInstancesPolicy=IgnoreNew and comes back
+            // ERROR_TASK_ALREADY_RUNNING. That used to read as a FAILED hand-off,
+            // so the unelevated copy did not exit — and an unelevated instance
+            // can never install its hooks (no SeDebugPrivilege), leaving every
+            // target capturable while the UI reported them protected.
+            //
+            // `run_task_now()` now treats ALREADY_RUNNING as success, and the Run
+            // key is removed whenever the task owns logon, so there is no second
+            // racer left. The removal itself already happened in
+            // `resolve_logon_ownership()` (it has to, to beat the single-instance
+            // lock); this re-asserts it through the plugin so the two agree and
+            // the toggle keeps working for non-elevated setups.
+            let mgr = app.autolaunch();
+            if elevated_mode {
+                let _ = mgr.disable();
+            } else if start_on_login {
+                let _ = mgr.enable();
+            }
+
+            // The elevation hand-off itself already happened in
+            // `resolve_logon_ownership()`, before the builder ran. Reaching here
+            // unelevated with elevated mode on means it could not produce an
+            // elevated copy; the engine-health banner below says so.
+            // (Running unelevated with elevated mode on is reported once the
+            // engine is up, alongside the rest of the engine-health state.)
+
+            // Rename migration: clean up any scheduled task from a prior
+            // product name, and if elevated mode is on but the (new-name)
+            // logon task doesn't exist yet, register it now. Both no-ops
+            // unless we're already elevated (e.g. launched by the OLD task at
+            // logon), in which case they happen with zero extra UAC prompts.
+            elevate::cleanup_retired_tasks();
+            if elevated_mode && privilege::is_elevated() && !elevate::task_installed() {
+                if let Ok(exe) = std::env::current_exe() {
+                    let _ = elevate::install_task(&exe);
+                }
+            }
+
+            // Never fatal. If the tray fails to build and we propagate the error,
+            // setup() aborts — and because the window starts hidden, that leaves a
+            // running process with no tray icon AND no window, reachable only via
+            // Task Manager. Log it and carry on; protection still runs, and the
+            // window can still be opened by relaunching the exe.
+            if let Err(e) = build_tray(&handle) {
+                push_log(
+                    &handle,
+                    "error",
+                    &format!("Tray icon unavailable: {e} — use the app window to control Windows Guard"),
+                );
+            }
 
             // When elevated, enable SeDebugPrivilege for the broadest process reach.
             if privilege::is_elevated() {
@@ -1069,9 +1524,63 @@ pub fn run() {
             // Bring up the signed hook engine (extracts + trusts the helper DLL,
             // loads it, starts the owner thread). Degrades gracefully if the DLL
             // can't be prepared.
-            match hook::init() {
-                Ok(()) => push_log(&handle, "info", "Protection engine ready (signed hook DLL)"),
-                Err(e) => push_log(&handle, "error", &format!("Protection engine unavailable: {e}")),
+            let init_result = hook::init();
+            let engine_started_ok = init_result.is_ok();
+            match init_result {
+                Ok(()) => {
+                    push_log(&handle, "info", "Protection engine ready (signed hook DLL)");
+                    set_engine_health(EngineHealth::Ready);
+                }
+                Err(e) => {
+                    push_log(&handle, "error", &format!("Protection engine unavailable: {e}"));
+                    set_engine_health(EngineHealth::Unavailable { reason: e.clone() });
+                    // A failed init used to be permanent for the session: the
+                    // engine never set up its channel, so every protect request
+                    // silently no-opped until the app was restarted. Retry in the
+                    // background — the usual causes (an antivirus holding the DLL,
+                    // %LOCALAPPDATA% not ready this early at logon) clear on their
+                    // own within seconds.
+                    let h = handle.clone();
+                    std::thread::spawn(move || loop {
+                        std::thread::sleep(std::time::Duration::from_secs(60));
+                        if hook::init().is_ok() {
+                            push_log(&h, "info", "Protection engine recovered");
+                            // Only clear the failure we own. Recovering the DLL
+                            // does not grant us rights we never had, so an
+                            // unelevated instance must stay Degraded — flipping
+                            // it to Ready here would re-hide the exact condition
+                            // this whole state was added to expose.
+                            if privilege::is_elevated() {
+                                set_engine_health(EngineHealth::Ready);
+                            }
+                            break;
+                        }
+                    });
+                }
+            }
+
+            // Elevated mode is on but we are NOT elevated: the hand-off in
+            // `resolve_logon_ownership()` could not produce an elevated copy.
+            // Protection will fail for every target that is itself elevated, so
+            // say so plainly instead of presenting a healthy-looking UI over an
+            // engine that cannot do its job. This is the state the user's
+            // original bug left the app in, silently, after every reboot.
+            //
+            // Only downgrade from Ready: if the engine failed to start at all it
+            // is already Unavailable, which is the more severe report of the two.
+            if elevated_mode && !privilege::is_elevated() && engine_started_ok {
+                let reason = if elevate::task_installed() {
+                    "Windows Guard is running without administrator rights, so it cannot protect \
+                     other apps. Windows did not start the elevated copy at logon — use \
+                     \"Restart elevated\" to fix this now."
+                } else {
+                    "Windows Guard is running without administrator rights, so it cannot protect \
+                     other apps. Its elevated start-up task isn't registered — use \"Restart \
+                     elevated\" and approve the prompt to set it up."
+                }
+                .to_string();
+                push_log(&handle, "error", &reason);
+                set_engine_health(EngineHealth::Degraded { reason });
             }
 
             events::spawn(handle.clone()); // instant, event-driven detection
@@ -1101,16 +1610,28 @@ pub fn run() {
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.set_content_protected(protect_self);
                 if !start_minimized {
-                    let _ = w.show();
+                    // Same verified path the tray click uses, so a failure to
+                    // appear at startup is logged instead of looking like the
+                    // app never launched.
+                    show_main(&handle);
                 }
             }
             Ok(())
         })
         .on_window_event(|window, event| {
             // Closing the window hides to tray so protection keeps running.
+            // Only safe while there is a tray icon to get back in through — if
+            // the tray failed to build, hiding here would strand the user with
+            // no window and no icon, so in that case we let the close proceed.
             if let WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
+                let app = window.app_handle();
+                if app.tray_by_id("main-tray").is_some() {
+                    api.prevent_close();
+                    let _ = window.hide();
+                } else {
+                    hook::shutdown();
+                    wablur::shutdown();
+                }
             }
         })
         .run(tauri::generate_context!())
