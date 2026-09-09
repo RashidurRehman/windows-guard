@@ -71,7 +71,7 @@ fn now_ms() -> u64 {
 }
 
 fn config_snapshot(app: &AppHandle) -> SyncConfig {
-    app.state::<AppState>().config.lock().unwrap().sync_monitor.clone()
+    { let st = app.state::<AppState>(); let g = st.config.lock().unwrap_or_else(|e| e.into_inner()); g.sync_monitor.clone() }
 }
 
 /// Manually pause/resume (independent of any timed meeting-mode pause).
@@ -134,7 +134,7 @@ fn emit_event(app: &AppHandle, spike_kb: u64, source: &str, pid: u32, quiet: boo
     LAST_EVENT_MS.store(now, Ordering::Relaxed);
     let date = day_key(now);
     {
-        let mut key = TODAY_KEY.lock().unwrap();
+        let mut key = TODAY_KEY.lock().unwrap_or_else(|e| e.into_inner());
         if *key != date {
             *key = date.clone();
             TODAY_COUNT.store(0, Ordering::Relaxed);
@@ -207,12 +207,12 @@ fn tick(app: &AppHandle, cfg: &SyncConfig) {
 
     let found = crate::winapi::find_any_process(&names);
     let Some((name, pid)) = found else {
-        *TRACKER_NAME.lock().unwrap() = String::new();
+        *TRACKER_NAME.lock().unwrap_or_else(|e| e.into_inner()) = String::new();
         TRACKER_PID.store(0, Ordering::Relaxed);
         LAST_MEM_KB.store(0, Ordering::Relaxed);
         return;
     };
-    *TRACKER_NAME.lock().unwrap() = name.clone();
+    *TRACKER_NAME.lock().unwrap_or_else(|e| e.into_inner()) = name.clone();
     TRACKER_PID.store(pid as u64, Ordering::Relaxed);
 
     // WebWorkTracker's screenshots are caught exactly by the file-watcher
@@ -259,7 +259,7 @@ pub fn spawn(app: AppHandle) {
         }
 
         if paused {
-            *TRACKER_NAME.lock().unwrap() = String::new();
+            *TRACKER_NAME.lock().unwrap_or_else(|e| e.into_inner()) = String::new();
             TRACKER_PID.store(0, Ordering::Relaxed);
             LAST_MEM_KB.store(0, Ordering::Relaxed);
         } else {
@@ -278,7 +278,7 @@ pub fn status(app: &AppHandle) -> SyncStatus {
         running: cfg.enabled,
         paused: is_paused() || cfg.paused,
         paused_until_ms: PAUSED_UNTIL_MS.load(Ordering::Relaxed),
-        tracker_name: TRACKER_NAME.lock().unwrap().clone(),
+        tracker_name: TRACKER_NAME.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         tracker_pid: TRACKER_PID.load(Ordering::Relaxed) as u32,
         last_poll_ms: LAST_POLL_MS.load(Ordering::Relaxed),
         last_event_ms: LAST_EVENT_MS.load(Ordering::Relaxed),

@@ -20,7 +20,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::PWSTR;
 use windows::Win32::System::Threading::{
-    AttachThreadInput, GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
@@ -576,22 +576,19 @@ pub fn force_foreground(h: HWND) -> bool {
             return true;
         }
 
-        let fg = GetForegroundWindow();
-        if !fg.is_invalid() && fg != h {
-            let fg_thread = GetWindowThreadProcessId(fg, None);
-            let our_thread = GetCurrentThreadId();
-            if fg_thread != 0 && fg_thread != our_thread {
-                let attached = AttachThreadInput(our_thread, fg_thread, true).as_bool();
-                let _ = SetForegroundWindow(h);
-                let _ = BringWindowToTop(h);
-                if attached {
-                    let _ = AttachThreadInput(our_thread, fg_thread, false);
-                }
-                if GetForegroundWindow() == h {
-                    return true;
-                }
-            }
-        }
+        // NOTE: we deliberately do NOT use AttachThreadInput here.
+        //
+        // Attaching our input queue to the foreground thread's is the classic
+        // way to make SetForegroundWindow legal, but it makes the two threads
+        // share an input state and block on each other. Calling it from
+        // startup (before the event loop is pumping) or against a thread that
+        // is itself waiting on us deadlocks the whole app: every thread ends
+        // up in Wait, the window never appears, the tray stops responding and
+        // no protection is ever applied — indistinguishable, from outside,
+        // from the app simply not working.
+        //
+        // Being *seen* is what the user needs, and the topmost flip below
+        // achieves that without ever borrowing another thread's input queue.
 
         // Last resort: raise it visually even if activation stays refused.
         let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;

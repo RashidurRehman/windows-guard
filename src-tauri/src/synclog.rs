@@ -181,7 +181,7 @@ fn days_since_epoch(today: &str) -> i64 {
 /// Prune by age + size cap, but at most once per calendar day.
 pub fn maybe_prune_daily(base: &Path, today: &str, retention_days: Option<u32>, max_mb: u32) {
     {
-        let mut last = LAST_PRUNED_DATE.lock().unwrap();
+        let mut last = LAST_PRUNED_DATE.lock().unwrap_or_else(|e| e.into_inner());
         if *last == today {
             return;
         }

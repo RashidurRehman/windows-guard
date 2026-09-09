@@ -1613,7 +1613,20 @@ pub fn run() {
                     // Same verified path the tray click uses, so a failure to
                     // appear at startup is logged instead of looking like the
                     // app never launched.
-                    show_main(&handle);
+                    //
+                    // Deferred onto the event loop rather than called inline:
+                    // `setup()` runs before the loop is pumping, and window
+                    // activation from here can block on threads that are
+                    // themselves waiting on us — which hangs the whole app
+                    // before the tray or the engine ever come up.
+                    let h2 = handle.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(400));
+                        let h3 = h2.clone();
+                        let _ = h2.run_on_main_thread(move || {
+                            show_main(&h3);
+                        });
+                    });
                 }
             }
             Ok(())

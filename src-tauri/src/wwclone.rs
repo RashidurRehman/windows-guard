@@ -105,7 +105,7 @@ fn run_watcher(app: &AppHandle, src_root: &Path, dst_dir: &Path) {
 }
 
 fn enabled(app: &AppHandle) -> bool {
-    app.state::<AppState>().config.lock().unwrap().sync_monitor.enabled
+    { let st = app.state::<AppState>(); let g = st.config.lock().unwrap_or_else(|e| e.into_inner()); g.sync_monitor.enabled }
 }
 
 pub fn spawn(app: AppHandle) {

@@ -73,12 +73,12 @@ static LAST_STATUS: Mutex<WaBlurStatus> = Mutex::new(WaBlurStatus {
 });
 
 pub fn status() -> WaBlurStatus {
-    LAST_STATUS.lock().unwrap().clone()
+    LAST_STATUS.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 fn set_state(app: &AppHandle, enabled: bool, state: WaBlurState) {
     let new = WaBlurStatus { enabled, state };
-    let mut cur = LAST_STATUS.lock().unwrap();
+    let mut cur = LAST_STATUS.lock().unwrap_or_else(|e| e.into_inner());
     let changed = *cur != new;
     *cur = new.clone();
     drop(cur);
