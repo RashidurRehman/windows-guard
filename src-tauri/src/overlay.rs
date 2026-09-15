@@ -65,7 +65,19 @@ fn position_top_center(app: &AppHandle, w: &WebviewWindow) {
 }
 
 /// Trigger a blink alert. Safe to call from any thread; non-blocking.
+///
+/// The real work is marshalled onto the main thread. Creating a webview
+/// window is a main-thread-only operation on Windows: calling
+/// `WebviewWindowBuilder::build()` from a background thread (this is reached
+/// from the syncmon/wwclone watcher threads) blocks that thread on the event
+/// loop while the event loop is itself waiting, and the whole app deadlocks -
+/// every thread parked in Wait, no tray response, no protection applied.
 pub fn trigger(app: &AppHandle) {
+    let app = app.clone();
+    let _ = app.clone().run_on_main_thread(move || trigger_on_main(&app));
+}
+
+fn trigger_on_main(app: &AppHandle) {
     let Some(w) = ensure_window(app) else { return };
     position_top_center(app, &w);
     let _ = w.set_ignore_cursor_events(true);
@@ -82,8 +94,12 @@ pub fn trigger(app: &AppHandle) {
     let app2 = app.clone();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(BLINK_COUNT * (ON_MS + OFF_MS) + 150));
-        if let Some(w) = app2.get_webview_window(OVERLAY_LABEL) {
-            let _ = w.hide();
-        }
+        // Back onto the main thread: hiding a window touches the same
+        // main-thread-only window machinery as creating one.
+        let _ = app2.clone().run_on_main_thread(move || {
+            if let Some(w) = app2.get_webview_window(OVERLAY_LABEL) {
+                let _ = w.hide();
+            }
+        });
     });
 }

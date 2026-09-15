@@ -1,6 +1,6 @@
 [package]
 name = "windows-guard"
-version = "0.1.4"
+version = "0.1.5"
 description = "Keep private apps out of screen recordings and screenshots"
 authors = ["you"]
 edition = "2021"

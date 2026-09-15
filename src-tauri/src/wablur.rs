@@ -219,7 +219,13 @@ fn pick_port() -> u16 {
 // --- CDP client (native; no external runtime needed) --------------------------
 
 fn fetch_json_list(port: u16) -> Option<Vec<serde_json::Value>> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    // CONNECT must be bounded. `TcpStream::connect` has no timeout of its own,
+    // and the read/write timeouts below only apply once a connection exists.
+    // After a hibernate/resume the old socket state can leave a connect hanging
+    // indefinitely, which parks this thread forever while it holds nothing but
+    // still stops the blur pipeline from ever recovering.
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3)).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
     stream.set_write_timeout(Some(Duration::from_secs(3))).ok()?;
     let req = format!(
@@ -247,10 +253,38 @@ fn find_ws_url(list: &[serde_json::Value]) -> Option<String> {
 /// re-assert (idempotent — the panel version-guards its own rebuild) so soft SPA
 /// navigations stay covered. Returns when the socket closes/errors or `gen`
 /// (this enable/disable cycle's generation) goes stale.
+/// Open a CDP WebSocket with a bounded TCP connect. Returns None if the host is
+/// unreachable, the connect times out, or the handshake fails.
+fn connect_ws_with_timeout(
+    ws_url: &str,
+) -> Option<(
+    tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+    tungstenite::handshake::client::Response,
+)> {
+    let url: tungstenite::http::Uri = ws_url.parse().ok()?;
+    let host = url.host()?;
+    let port = url.port_u16().unwrap_or(80);
+    let addr = format!("{host}:{port}")
+        .parse::<std::net::SocketAddr>()
+        .ok()
+        .or_else(|| {
+            use std::net::ToSocketAddrs;
+            (host, port).to_socket_addrs().ok()?.next()
+        })?;
+    let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(3)).ok()?;
+    tcp.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    tcp.set_write_timeout(Some(Duration::from_secs(5))).ok()?;
+    tungstenite::client::client(ws_url, tungstenite::stream::MaybeTlsStream::Plain(tcp)).ok()
+}
+
 fn run_ws_loop(ws_url: &str, gen: u16) {
-    let (mut socket, _resp) = match tungstenite::connect(ws_url) {
-        Ok(v) => v,
-        Err(_) => return,
+    // Same reasoning as `fetch_json_list`: establish the TCP connection with an
+    // explicit timeout and hand the ready socket to tungstenite, rather than
+    // letting `tungstenite::connect` do an unbounded connect that a resumed
+    // machine can leave hanging for good.
+    let (mut socket, _resp) = match connect_ws_with_timeout(ws_url) {
+        Some(v) => v,
+        None => return,
     };
     if let tungstenite::stream::MaybeTlsStream::Plain(tcp) = socket.get_ref() {
         let _ = tcp.set_read_timeout(Some(Duration::from_millis(400)));

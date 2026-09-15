@@ -146,7 +146,35 @@ pub fn spawn(app: AppHandle) {
     std::thread::spawn(move || {
         let mut live: HashMap<String, ()> = HashMap::new();
         loop {
-            let active = tick(&app, &mut live);
+            // `tick` creates and closes badge webviews, which is a
+            // main-thread-only operation on Windows. Calling
+            // `WebviewWindowBuilder::build()` straight from this worker parks
+            // it on the event loop while the event loop waits on us, and the
+            // whole app deadlocks. Marshal the tick over and wait for the
+            // answer so the poll cadence below still reflects real state.
+            let (tx, rx) = std::sync::mpsc::channel::<(bool, HashMap<String, ()>)>();
+            let mut taken = std::mem::take(&mut live);
+            let app2 = app.clone();
+            if app
+                .run_on_main_thread(move || {
+                    let active = tick(&app2, &mut taken);
+                    // Hand the map back: it tracks which badges exist, so
+                    // dropping it here would leak a webview per target.
+                    let _ = tx.send((active, taken));
+                })
+                .is_err()
+            {
+                // Event loop is gone (app shutting down) - stop the supervisor
+                // rather than spinning against a dead handle.
+                return;
+            }
+            let active = match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok((active, returned)) => {
+                    live = returned;
+                    active
+                }
+                Err(_) => false,
+            };
             // Each tick enumerates windows and probes every badged target. With
             // no badges enabled — the default, and every target's current state —
             // that work is pure waste at 1Hz, so back off hard until the user
