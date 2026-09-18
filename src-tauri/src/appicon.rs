@@ -155,18 +155,16 @@ pub fn spawn(app: AppHandle) {
             let (tx, rx) = std::sync::mpsc::channel::<(bool, HashMap<String, ()>)>();
             let mut taken = std::mem::take(&mut live);
             let app2 = app.clone();
-            if app
-                .run_on_main_thread(move || {
-                    let active = tick(&app2, &mut taken);
-                    // Hand the map back: it tracks which badges exist, so
-                    // dropping it here would leak a webview per target.
-                    let _ = tx.send((active, taken));
-                })
-                .is_err()
-            {
-                // Event loop is gone (app shutting down) - stop the supervisor
-                // rather than spinning against a dead handle.
-                return;
+            // Skipped entirely until the event loop is live: queueing this
+            // during `setup()` would block on a loop that has not started.
+            if !crate::on_main_thread(&app, move || {
+                let active = tick(&app2, &mut taken);
+                // Hand the map back: it tracks which badges exist, so
+                // dropping it here would leak a webview per target.
+                let _ = tx.send((active, taken));
+            }) {
+                std::thread::sleep(std::time::Duration::from_millis(IDLE_POLL_MS));
+                continue;
             }
             let active = match rx.recv_timeout(std::time::Duration::from_secs(10)) {
                 Ok((active, returned)) => {

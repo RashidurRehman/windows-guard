@@ -294,7 +294,7 @@ impl Default for Config {
             master_enabled: true,
             interval_secs: 15,
             start_on_login: true,
-            start_minimized: true,
+            start_minimized: false,
             protect_self: true,
             elevated_mode: true,
             privacy_veil: false,

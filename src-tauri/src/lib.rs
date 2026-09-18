@@ -30,6 +30,29 @@ use tauri_plugin_opener::OpenerExt;
 // Shared state & payloads
 // ---------------------------------------------------------------------------
 
+/// Set once the Tauri event loop is actually running.
+///
+/// `setup()` runs BEFORE `.run()` starts pumping the event loop, and it is
+/// where every background thread is spawned. Those threads can reach window
+/// work within milliseconds (syncmon detects a screenshot and fires the
+/// overlay), and `run_on_main_thread` only queues a closure for the loop to
+/// pick up. Queue one while the main thread is still inside `setup()` and
+/// nothing ever runs it: the caller waits on a loop that has not started, and
+/// the app hangs before the tray or the hook engine come up.
+pub static EVENT_LOOP_READY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Run `f` on the main thread, but only once the event loop can service it.
+/// Before then the request is dropped rather than queued: these are all
+/// best-effort UI touches (an overlay blink, a badge reposition), and skipping
+/// one is infinitely better than wedging the whole app at startup.
+pub fn on_main_thread<F: FnOnce() + Send + 'static>(app: &AppHandle, f: F) -> bool {
+    if !EVENT_LOOP_READY.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
+    app.run_on_main_thread(f).is_ok()
+}
+
 pub struct AppState {
     pub config: Mutex<Config>,
     pub engine: Engine,
@@ -1325,7 +1348,18 @@ pub fn run() {
         // has already exited by the time the elevated copy is up, so the
         // elevated copy is not treated as a second instance.
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            show_main(app);
+            // Dropped rather than run inline while the event loop is still
+            // starting - see `on_main_thread`. This callback fires on the
+            // plugin's own IPC thread the instant a second launch is
+            // detected, which can be within milliseconds of `run()` being
+            // called - before `.run()` even starts pumping. Calling
+            // `show_main` (and the Tauri webview/window calls inside it)
+            // that early blocks on a loop that has not started yet, and the
+            // whole app hangs before the tray or the hook engine come up.
+            let app2 = app.clone();
+            on_main_thread(app, move || {
+                show_main(&app2);
+            });
         }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(
@@ -1623,9 +1657,29 @@ pub fn run() {
                     std::thread::spawn(move || {
                         std::thread::sleep(std::time::Duration::from_millis(400));
                         let h3 = h2.clone();
-                        let _ = h2.run_on_main_thread(move || {
-                            show_main(&h3);
-                        });
+                        // `on_main_thread`, not a bare `run_on_main_thread`: the
+                        // 400ms delay is not always enough for the event loop to
+                        // be pumping yet on a slow/loaded boot, and queueing onto
+                        // a loop that has not started leaves the window stuck in
+                        // its initial hidden state with no error - indistinguishable
+                        // from `start_minimized` being on. Retry with backoff
+                        // instead of a single best-effort attempt.
+                        for _ in 0..20 {
+                            if on_main_thread(&h2, {
+                                let h3 = h3.clone();
+                                move || {
+                                    show_main(&h3);
+                                }
+                            }) {
+                                return;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                        }
+                        push_log(
+                            &h2,
+                            "error",
+                            "Could not show the window at startup: the event loop never became ready.",
+                        );
                     });
                 }
             }
@@ -1647,6 +1701,13 @@ pub fn run() {
                 }
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            // The loop is live from its first callback onward, so anything
+            // queued from here on will actually be serviced.
+            if let tauri::RunEvent::Ready = event {
+                EVENT_LOOP_READY.store(true, std::sync::atomic::Ordering::Release);
+            }
+        })
 }

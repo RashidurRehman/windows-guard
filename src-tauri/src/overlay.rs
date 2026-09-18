@@ -73,8 +73,11 @@ fn position_top_center(app: &AppHandle, w: &WebviewWindow) {
 /// loop while the event loop is itself waiting, and the whole app deadlocks -
 /// every thread parked in Wait, no tray response, no protection applied.
 pub fn trigger(app: &AppHandle) {
-    let app = app.clone();
-    let _ = app.clone().run_on_main_thread(move || trigger_on_main(&app));
+    let app2 = app.clone();
+    // Dropped (not queued) while the event loop is still starting - see
+    // `crate::on_main_thread`. A missed blink is harmless; a queued closure
+    // that nothing can run hangs the app.
+    crate::on_main_thread(app, move || trigger_on_main(&app2));
 }
 
 fn trigger_on_main(app: &AppHandle) {
@@ -96,8 +99,9 @@ fn trigger_on_main(app: &AppHandle) {
         std::thread::sleep(Duration::from_millis(BLINK_COUNT * (ON_MS + OFF_MS) + 150));
         // Back onto the main thread: hiding a window touches the same
         // main-thread-only window machinery as creating one.
-        let _ = app2.clone().run_on_main_thread(move || {
-            if let Some(w) = app2.get_webview_window(OVERLAY_LABEL) {
+        let app3 = app2.clone();
+        crate::on_main_thread(&app2, move || {
+            if let Some(w) = app3.get_webview_window(OVERLAY_LABEL) {
                 let _ = w.hide();
             }
         });
