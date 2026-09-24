@@ -13,10 +13,10 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, EnumWindows, GetClassNameW, GetForegroundWindow, GetWindow,
-    GetWindowDisplayAffinity, GetWindowLongW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsIconic, IsWindowVisible, SetForegroundWindow, SetWindowPos,
-    ShowWindow, GWL_EXSTYLE, GW_OWNER, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SW_RESTORE, SW_SHOW, WS_EX_TOOLWINDOW,
+    GetWindowDisplayAffinity, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsIconic,
+    IsWindowVisible, SendMessageTimeoutW, SetForegroundWindow, SetWindowPos, ShowWindow,
+    GWL_EXSTYLE, GW_OWNER, HWND_NOTOPMOST, HWND_TOPMOST, SMTO_ABORTIFHUNG, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SW_RESTORE, SW_SHOW, WM_GETTEXT, WM_GETTEXTLENGTH, WS_EX_TOOLWINDOW,
 };
 use windows::core::PWSTR;
 use windows::Win32::System::Threading::{
@@ -93,7 +93,7 @@ pub fn matched_windows_in(
 
     for h in candidate_windows() {
         let visible = unsafe { IsWindowVisible(h).as_bool() };
-        let has_title = unsafe { GetWindowTextLengthW(h) } > 0;
+        let has_title = get_window_text_length_safe(h) > 0;
 
         let in_pool = if all_windows {
             visible
@@ -274,8 +274,8 @@ fn is_user_dialog(h: HWND) -> bool {
         if ex & WS_EX_TOOLWINDOW.0 != 0 {
             return false;
         }
-        GetWindowTextLengthW(h) > 0
     }
+    get_window_text_length_safe(h) > 0
 }
 
 /// DWM "cloaked" — the window is composed but deliberately not shown (a
@@ -327,14 +327,61 @@ fn class_name(h: HWND) -> String {
     }
 }
 
+/// `GetWindowTextLengthW`/`GetWindowTextW` are thin wrappers around
+/// `SendMessageW(WM_GETTEXTLENGTH/WM_GETTEXT)` — a SYNCHRONOUS cross-thread
+/// call that blocks the caller until the target window's own thread services
+/// it. Calling that on our OWN main window, from a background thread, while
+/// the main thread can itself be blocked waiting on a lock inside a window
+/// procedure, is a real deadlock we hit in production: this thread parks in
+/// `SendMessageW` forever, the main thread parks on the lock forever, and
+/// nothing ever resolves it because there is no timeout anywhere in the
+/// chain. `SendMessageTimeoutW` with `SMTO_ABORTIFHUNG` bounds the wait: past
+/// the timeout we get an error back and treat the window as textless rather
+/// than hanging the whole app.
+const TEXT_QUERY_TIMEOUT_MS: u32 = 500;
+
+fn get_window_text_length_safe(h: HWND) -> i32 {
+    let mut result: usize = 0;
+    unsafe {
+        let ok = SendMessageTimeoutW(
+            h,
+            WM_GETTEXTLENGTH,
+            windows::Win32::Foundation::WPARAM(0),
+            windows::Win32::Foundation::LPARAM(0),
+            SMTO_ABORTIFHUNG,
+            TEXT_QUERY_TIMEOUT_MS,
+            Some(&mut result as *mut usize as *mut usize),
+        );
+        if ok.0 == 0 {
+            return 0;
+        }
+    }
+    result as i32
+}
+
 fn window_title(h: HWND) -> String {
-    let len = unsafe { GetWindowTextLengthW(h) };
+    let len = get_window_text_length_safe(h);
     if len <= 0 {
         return String::new();
     }
     let mut buf = vec![0u16; (len + 1) as usize];
-    let n = unsafe { GetWindowTextW(h, &mut buf) };
-    String::from_utf16_lossy(&buf[..n as usize])
+    let mut result: usize = 0;
+    let ok = unsafe {
+        SendMessageTimeoutW(
+            h,
+            WM_GETTEXT,
+            windows::Win32::Foundation::WPARAM((len + 1) as usize),
+            windows::Win32::Foundation::LPARAM(buf.as_mut_ptr() as isize),
+            SMTO_ABORTIFHUNG,
+            TEXT_QUERY_TIMEOUT_MS,
+            Some(&mut result as *mut usize as *mut usize),
+        )
+    };
+    if ok.0 == 0 {
+        return String::new();
+    }
+    let n = (result as usize).min(buf.len());
+    String::from_utf16_lossy(&buf[..n])
 }
 
 // --- process table ------------------------------------------------------------
@@ -626,7 +673,7 @@ mod tests {
                 owned_counted += 1;
                 // Anything we DO count must be visible and titled.
                 assert!(unsafe { IsWindowVisible(h).as_bool() });
-                assert!(unsafe { GetWindowTextLengthW(h) } > 0);
+                assert!(get_window_text_length_safe(h) > 0);
             }
         }
         eprintln!("owned={owned} counted_as_dialog={owned_counted}");
